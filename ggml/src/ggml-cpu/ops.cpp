@@ -1129,9 +1129,6 @@ void ggml_compute_forward_add1(
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q8_1:
-        case GGML_TYPE_Q8_CR:
-        case GGML_TYPE_Q5_CR:
-        case GGML_TYPE_Q6_CR:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q2_K:
@@ -5260,6 +5257,9 @@ void ggml_compute_forward_set(
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q8_1:
+        case GGML_TYPE_Q8_CR:
+        case GGML_TYPE_Q5_CR:
+        case GGML_TYPE_Q6_CR:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q2_K:
@@ -5487,6 +5487,9 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q8_1:
+        case GGML_TYPE_Q8_CR:
+        case GGML_TYPE_Q5_CR:
+        case GGML_TYPE_Q6_CR:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q2_K:
