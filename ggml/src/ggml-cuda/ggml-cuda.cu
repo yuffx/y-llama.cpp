@@ -2655,6 +2655,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const ggml_tensor * src0 = src0_;
     const ggml_tensor * src1 = src1_;
+    const bool is_cr = src0->type == GGML_TYPE_Q8_CR ||
+                       src0->type == GGML_TYPE_Q5_CR ||
+                       src0->type == GGML_TYPE_Q6_CR;
 
     if (src0->type == GGML_TYPE_Q8_CR) {
         if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
@@ -2727,6 +2730,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    // Full-model CUDA inference with CR weights is not numerically reliable through
+    // MMVQ/MMQ even though the small random operator tests pass. Keep the CUDA
+    // activation rotation, then use the dequantize + cuBLAS path until the fast
+    // quantized kernels have production-shape correctness coverage.
+    if (is_cr) {
+        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        return;
+    }
+
     // TQ weight types use the fused dp4a path (all batch sizes), not mmvq/mmq
     const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
     if (is_tq_weight) {
@@ -2743,8 +2755,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             return;
         }
         // TQ3_1S large batch: dequant + cuBLAS via the generic fallback below
-        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
-        return;
     }
 
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
