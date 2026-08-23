@@ -6283,6 +6283,9 @@ class GGMLQuantizationType(IntEnum):
     TQ3_1S  = 45
     TQ4_1S  = 46
     Q2_0    = 47  # upstream id 42; renumbered on this fork (42-46 are TurboQuant)
+    Q8_CR   = 48
+    Q5_CR   = 49
+    Q6_CR   = 50
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6339,8 +6342,11 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
+    MOSTLY_Q8_CR         = 42  # except 1d tensors, ConvRot-rotated Q8_0
     MOSTLY_TQ3_1S        = 43  # except 1d tensors
     MOSTLY_TQ4_1S        = 44  # except 1d tensors
+    MOSTLY_Q5_CR         = 45  # except 1d tensors, ConvRot-rotated Q5_0
+    MOSTLY_Q6_CR         = 46  # except 1d tensors, ConvRot-rotated Q6_K
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -6505,6 +6511,12 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.TQ3_1S:  (32, 2 + 2 + 12),
     GGMLQuantizationType.TQ4_1S:  (32, 2 + 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    # same layout as Q8_0, but the rows are rotated in groups of 256 (ConvRot)
+    GGMLQuantizationType.Q8_CR:   (256, 8 * (2 + 32)),
+    # same layout as Q5_0, but the rows are rotated in groups of 256 (ConvRot)
+    GGMLQuantizationType.Q5_CR:   (256, 8 * (2 + 4 + 16)),
+    # same layout as Q6_K (256 elements/block), but the rows are rotated in groups of 256 (ConvRot)
+    GGMLQuantizationType.Q6_CR:   (256, 2 + 128 + 64 + 16),   # block_q6_K: d(2)+ql(128)+qh(64)+scales(16)
 }
 
 

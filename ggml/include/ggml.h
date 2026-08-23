@@ -450,7 +450,10 @@ extern "C" {
         GGML_TYPE_TQ3_1S  = 45, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
         GGML_TYPE_TQ4_1S  = 46, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
         GGML_TYPE_Q2_0    = 47, // upstream id 42; renumbered on this fork (42-46 are TurboQuant), GGUFs quantized with upstream Q2_0 are incompatible
-        GGML_TYPE_COUNT   = 48,
+        GGML_TYPE_Q8_CR   = 48, // Q8_0 blocks of a ConvRot-rotated tensor
+        GGML_TYPE_Q5_CR   = 49, // Q5_0 blocks of a ConvRot-rotated tensor
+        GGML_TYPE_Q6_CR   = 50, // Q6_K blocks of a ConvRot-rotated tensor
+        GGML_TYPE_COUNT   = 51,
     };
 
     // [TAG_GGML_PREC]
@@ -507,6 +510,9 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q8_CR   = 29, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q5_CR   = 30, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q6_CR   = 31, // except 1d tensors
     };
 
     // available tensor operations:
