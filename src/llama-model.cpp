@@ -775,6 +775,39 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
             }
         }
+        // GigaChat 3.5 alternates MLA attention blocks with linear-attention (recurrent)
+        // blocks. The MLA side shares the single KV latent head of the other MLA archs,
+        // which no head split can divide, so replicate it whole - same reasoning as
+        // llm_arch_sm_tensor_replicates_attention, caches included: a row split of the
+        // latent cache desyncs the set_rows KV write against the mirrored Kcur. The
+        // recurrent side keeps the qwen3next-style splits, the FFN and the output keep
+        // their own rules below.
+        if (ud->model->arch == LLM_ARCH_GIGACHAT35) {
+            long il_gc = -1;
+            if (tensor_name.compare(0, 4, "blk.") == 0) {
+                const size_t dot = tensor_name.find('.', 4);
+                if (dot != std::string::npos) {
+                    il_gc = std::stol(tensor_name.substr(4, dot - 4));
+                }
+            } else if (tensor_name.compare(0, 6, "cache_") == 0) {
+                const size_t lpos = tensor_name.find("_l", 6);
+                if (lpos != std::string::npos) {
+                    il_gc = std::stol(tensor_name.substr(lpos + 2));
+                }
+            }
+            const bool recr_side = il_gc >= 0 && il_gc < (long) hparams.n_layer_all && hparams.is_recr((uint32_t) il_gc);
+            const bool is_ffn =
+                std::regex_match(tensor_name, pattern_ffn_up_weight)      || std::regex_match(tensor_name, pattern_ffn_gate_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_up_bias)       || std::regex_match(tensor_name, pattern_ffn_gate_bias)   ||
+                std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_down_weight)   || std::regex_match(tensor_name, pattern_ffn_down_bias)   ||
+                std::regex_match(tensor_name, pattern_ffn_down_exps_bias);
+            const bool is_output = tied_output ||
+                std::regex_match(tensor_name, pattern_output_weight) || std::regex_match(tensor_name, pattern_output_bias);
+            if (!recr_side && !is_ffn && !is_output) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+        }
         if (replicate_attention) {
             // split only the FFN/experts and the output projection, mirror all the rest
             const bool is_ffn =
