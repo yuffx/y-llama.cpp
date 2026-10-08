@@ -222,7 +222,7 @@ void ggml_cuda_mul_mat_q(
                 ne00, ne01, iter_ne11, s01, iter_ne11, s1,
                 ne02, ne12, s02, ys12, s2,
                 ne03, ne13, s03, ys13, s3,
-                iter_ne11};
+                iter_ne11, iter_ne11};
             ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         }
         return;
@@ -359,9 +359,10 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, iter_rows, s01, iter_rows, s1,
             ne02, ne02, s02, workspace_s12, s2,
             ne03, ne13, s03, workspace_s13, s3,
-            iter_ne12};
+            iter_ne12, iter_ne12};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
     }
+
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
@@ -483,10 +484,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         return true;
     }
 
-    // gfx900 (Vega 10) lacks native dp4a, loses to dequant + hipBLAS
+    // gfx900 (Vega 10), gfx909, and gfx90c lack native dp4a, losing to dequant + hipBLAS
     // for dense matrices; keep MMQ only for MoE, where the
     // hipBLAS path is much slower.
-    if (cc == GGML_CUDA_CC_VEGA) {
+    if (cc == GGML_CUDA_CC_VEGA || GGML_CUDA_CC_IS_GCN_APU(cc)) {
         return n_experts > 0;
     }
 

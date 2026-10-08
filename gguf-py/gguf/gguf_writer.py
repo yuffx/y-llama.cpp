@@ -733,8 +733,11 @@ class GGUFWriter:
         else:
             self.add_array(Keys.LLM.FEED_FORWARD_LENGTH.format(arch=self.arch), length)
 
-    def add_expert_feed_forward_length(self, length: int) -> None:
-        self.add_uint32(Keys.LLM.EXPERT_FEED_FORWARD_LENGTH.format(arch=self.arch), length)
+    def add_expert_feed_forward_length(self, length: int | Sequence[int]) -> None:
+        if isinstance(length, int):
+            self.add_uint32(Keys.LLM.EXPERT_FEED_FORWARD_LENGTH.format(arch=self.arch), length)
+        else:
+            self.add_array(Keys.LLM.EXPERT_FEED_FORWARD_LENGTH.format(arch=self.arch), length)
 
     def add_expert_shared_feed_forward_length(self, length: int) -> None:
         self.add_uint32(Keys.LLM.EXPERT_SHARED_FEED_FORWARD_LENGTH.format(arch=self.arch), length)
@@ -830,6 +833,9 @@ class GGUFWriter:
     def add_shared_kv_layers(self, value: int) -> None:
         self.add_uint32(Keys.Attention.SHARED_KV_LAYERS.format(arch=self.arch), value)
 
+    def add_recurrent_layers(self, value: Sequence[bool]) -> None:
+        self.add_array(Keys.Attention.RECURRENT_LAYERS.format(arch=self.arch), value)
+
     # if input is array, true means SWA and false means full_attention for each layer
     def add_sliding_window_pattern(self, value: int | Sequence[bool]) -> None:
         key = Keys.Attention.SLIDING_WINDOW_PATTERN.format(arch=self.arch)
@@ -837,6 +843,9 @@ class GGUFWriter:
             self.add_uint32(key, value)
         else:
             self.add_array(key, value)
+
+    def add_recurrent_layers(self, value: Sequence[bool]) -> None:
+        self.add_array(Keys.Attention.RECURRENT_LAYERS.format(arch=self.arch), value)
 
     def add_rope_pattern(self, value: Sequence[bool]) -> None:
         self.add_array(Keys.Attention.ROPE_PATTERN.format(arch=self.arch), value)
@@ -860,8 +869,11 @@ class GGUFWriter:
     def add_expert_count(self, count: int) -> None:
         self.add_uint32(Keys.LLM.EXPERT_COUNT.format(arch=self.arch), count)
 
-    def add_expert_used_count(self, count: int) -> None:
-        self.add_uint32(Keys.LLM.EXPERT_USED_COUNT.format(arch=self.arch), count)
+    def add_expert_used_count(self, count: int | Sequence[int]) -> None:
+        if isinstance(count, int):
+            self.add_uint32(Keys.LLM.EXPERT_USED_COUNT.format(arch=self.arch), count)
+        else:
+            self.add_array(Keys.LLM.EXPERT_USED_COUNT.format(arch=self.arch), count)
 
     def add_expert_shared_count(self, count: int) -> None:
         self.add_uint32(Keys.LLM.EXPERT_SHARED_COUNT.format(arch=self.arch), count)
@@ -922,6 +934,18 @@ class GGUFWriter:
 
     def add_embedding_scale(self, value: float) -> None:
         self.add_float32(Keys.LLM.EMBEDDING_SCALE.format(arch=self.arch), value)
+
+    def add_hrm_layers_per_stack(self, value: int) -> None:
+        self.add_uint32(Keys.HRM.LAYERS_PER_STACK.format(arch=self.arch), value)
+
+    def add_hrm_h_cycles(self, value: int) -> None:
+        self.add_uint32(Keys.HRM.H_CYCLES.format(arch=self.arch), value)
+
+    def add_hrm_l_cycles(self, value: int) -> None:
+        self.add_uint32(Keys.HRM.L_CYCLES.format(arch=self.arch), value)
+
+    def add_hrm_prefix_lm(self, value: bool) -> None:
+        self.add_bool(Keys.HRM.PREFIX_LM.format(arch=self.arch), value)
 
     def add_adapter_count(self, count: int) -> None:
         self.add_uint32(Keys.Adapters.COUNT.format(arch=self.arch), count)
@@ -1048,6 +1072,9 @@ class GGUFWriter:
 
     def add_hyper_connection_epsilon(self, value: float) -> None:
         self.add_float32(Keys.HyperConnection.EPSILON.format(arch=self.arch), value)
+
+    def add_hyper_connection_magnitude(self, value: float) -> None:
+        self.add_float32(Keys.HyperConnection.MAGNITUDE.format(arch=self.arch), value)
 
     def add_hyper_connection_low_rank(self, value: int) -> None:
         self.add_uint32(Keys.HyperConnection.LOW_RANK.format(arch=self.arch), value)

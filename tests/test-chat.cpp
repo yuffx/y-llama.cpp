@@ -472,6 +472,12 @@ static common_chat_tool empty_args_tool_no_properties{
     })",
 };
 
+static common_chat_tool empty_args_tool_no_schema{
+    /* .name = */ "empty_args_no_schema",
+    /* .description = */ "A tool that takes no arguments and has no parameters schema",
+    /* .parameters = */ "{}",
+};
+
 static common_chat_tool python_tool{
     /* .name = */ "python",
     /* .description = */ "an ipython interpreter",
@@ -837,6 +843,25 @@ static common_chat_tool nullable_int_tool{
             }
         },
         "required": ["count"]
+    })",
+};
+
+static common_chat_tool string_union_tool{
+    /* .name = */ "set_union",
+    /* .description = */ "Set values whose types are unions with string",
+    /* .parameters = */ R"({
+        "type": "object",
+        "properties": {
+            "value": {
+                "type": ["string", "object"],
+                "description": "A string or object value"
+            },
+            "amount": {
+                "type": ["string", "integer"],
+                "description": "A string or integer value"
+            }
+        },
+        "required": ["value", "amount"]
     })",
 };
 
@@ -1479,6 +1504,11 @@ class peg_test_builder {
 
     peg_test_builder & enable_thinking(bool val) {
         tc_.params.enable_thinking = val;
+        return *this;
+    }
+
+    peg_test_builder & chat_template_kwargs(std::map<std::string, std::string> kwargs) {
+        tc_.params.chat_template_kwargs = std::move(kwargs);
         return *this;
     }
 
@@ -3799,6 +3829,46 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             })
             .run();
 
+        // nullable string given null - parses as JSON null, not the string "null"
+        tst.test(
+               "<tool_call>\n"
+               "<function=set_nullable_str>\n"
+               "<parameter=name>\nnull\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ nullable_string_tool })
+            .expect_tool_calls({
+                { "set_nullable_str", R"({"name": null})", {} },
+            })
+            .run();
+
+        // unions with string - JSON values of the other types are typed, everything else is a string
+        tst.test(
+               "<tool_call>\n"
+               "<function=set_union>\n"
+               "<parameter=value>\n{\"a\": 1}\n</parameter>\n"
+               "<parameter=amount>\n2 dollars\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ string_union_tool })
+            .expect_tool_calls({
+                { "set_union", R"({"value": {"a": 1}, "amount": "2 dollars"})", {} },
+            })
+            .run();
+
+        tst.test(
+               "<tool_call>\n"
+               "<function=set_union>\n"
+               "<parameter=value>\n{not valid json\n</parameter>\n"
+               "<parameter=amount>\n42\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ string_union_tool })
+            .expect_tool_calls({
+                { "set_union", R"({"value": "{not valid json", "amount": 42})", {} },
+            })
+            .run();
+
         // enum without explicit type key - should infer string from enum values
         tst.test(
                "<tool_call>\n"
@@ -4288,6 +4358,184 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
+    // GigaChat 3.5 tests - format uses GCML markup inside the assistant message:
+    //   <｜GCML｜tool_calls>
+    //   <｜GCML｜invoke name="foo">
+    //   <｜GCML｜parameter name="bar" string="true|false">value</｜GCML｜parameter>
+    //   </｜GCML｜invoke>
+    //   </｜GCML｜tool_calls>
+    {
+        auto tst = peg_tester("models/templates/GigaChat3.5.jinja", detailed_debug);
+
+        tst.test("Hello, world!\nWhat's up?")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist)
+            .expect_reconstruction()
+            .run();
+
+        tst.test("I'm\nthinking</think>\n\nHello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .chat_template_kwargs({ { "reasoning", "true" } })
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist_thoughts)
+            .run();
+
+        tst.test(
+               "<｜GCML｜tool_calls>\n"
+               "<｜GCML｜invoke name=\"special_function\">\n"
+               "<｜GCML｜parameter name=\"arg1\" string=\"false\">1</｜GCML｜parameter>\n"
+               "</｜GCML｜invoke>\n"
+               "</｜GCML｜tool_calls>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+
+        tst.test(
+               "Let me check</think>\n\n"
+               "<｜GCML｜tool_calls>\n"
+               "<｜GCML｜invoke name=\"get_time\">\n"
+               "<｜GCML｜parameter name=\"city\" string=\"true\">Tokyo</｜GCML｜parameter>\n"
+               "</｜GCML｜invoke>\n"
+               "</｜GCML｜tool_calls>")
+            .enable_thinking(true)
+            .chat_template_kwargs({ { "reasoning", "true" } })
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_time_tool })
+            .expect(message_with_tool_calls_and_reasoning("get_time", R"({"city": "Tokyo"})", "Let me check"))
+            .run();
+
+        tst.test(
+               "Calling both</think>\n\n"
+               "<｜GCML｜tool_calls>\n"
+               "<｜GCML｜invoke name=\"get_time\">\n"
+               "<｜GCML｜parameter name=\"city\" string=\"true\">Paris</｜GCML｜parameter>\n"
+               "</｜GCML｜invoke>\n"
+               "<｜GCML｜invoke name=\"get_weather\">\n"
+               "<｜GCML｜parameter name=\"city\" string=\"true\">Paris</｜GCML｜parameter>\n"
+               "</｜GCML｜invoke>\n"
+               "</｜GCML｜tool_calls>")
+            .enable_thinking(true)
+            .chat_template_kwargs({ { "reasoning", "true" } })
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .parallel_tool_calls(true)
+            .tools({ get_time_tool, get_weather_tool })
+            .expect(message_with_reasoning_content_and_multiple_tool_calls(
+                "Calling both", "",
+                { { "get_time", R"({"city": "Paris"})" }, { "get_weather", R"({"city": "Paris"})" } }))
+            .run();
+
+        // Continuation tests
+        tst.test("world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .messages({ message_user, message_assist_prefill_content })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_CONTENT)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+
+        tst.test(" thinking</think>\n\nHello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .messages({ message_user, message_assist_prefill_reasoning })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_REASONING)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+    }
+
+    // GigaChat 3.5 Reasoning tests - same GCML markup, but the template always opens
+    // a forced "<think>" in the generation prompt (no opt-out) and every assistant
+    // turn carries a think block (empty "<think></think>" when there is no reasoning)
+    {
+        auto tst = peg_tester("models/templates/GigaChat3.5-Reasoning.jinja", detailed_debug);
+
+        // model closes the forced think block immediately and answers
+        tst.test("</think>\n\nHello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist)
+            .run();
+
+        tst.test("I'm\nthinking</think>\n\nHello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist_thoughts)
+            .run();
+
+        tst.test(
+               "</think>\n\n"
+               "<｜GCML｜tool_calls>\n"
+               "<｜GCML｜invoke name=\"special_function\">\n"
+               "<｜GCML｜parameter name=\"arg1\" string=\"false\">1</｜GCML｜parameter>\n"
+               "</｜GCML｜invoke>\n"
+               "</｜GCML｜tool_calls>")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+
+        tst.test(
+               "Let me check</think>\n\n"
+               "<｜GCML｜tool_calls>\n"
+               "<｜GCML｜invoke name=\"get_time\">\n"
+               "<｜GCML｜parameter name=\"city\" string=\"true\">Tokyo</｜GCML｜parameter>\n"
+               "</｜GCML｜invoke>\n"
+               "</｜GCML｜tool_calls>")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_time_tool })
+            .expect(message_with_tool_calls_and_reasoning("get_time", R"({"city": "Tokyo"})", "Let me check"))
+            .run();
+
+        tst.test(
+               "Calling both</think>\n\n"
+               "<｜GCML｜tool_calls>\n"
+               "<｜GCML｜invoke name=\"get_time\">\n"
+               "<｜GCML｜parameter name=\"city\" string=\"true\">Paris</｜GCML｜parameter>\n"
+               "</｜GCML｜invoke>\n"
+               "<｜GCML｜invoke name=\"get_weather\">\n"
+               "<｜GCML｜parameter name=\"city\" string=\"true\">Paris</｜GCML｜parameter>\n"
+               "</｜GCML｜invoke>\n"
+               "</｜GCML｜tool_calls>")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .parallel_tool_calls(true)
+            .tools({ get_time_tool, get_weather_tool })
+            .expect(message_with_reasoning_content_and_multiple_tool_calls(
+                "Calling both", "",
+                { { "get_time", R"({"city": "Paris"})" }, { "get_weather", R"({"city": "Paris"})" } }))
+            .run();
+
+        // Continuation tests
+        tst.test("world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .messages({ message_user, message_assist_prefill_content })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_CONTENT)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+
+        tst.test(" thinking</think>\n\nHello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .messages({ message_user, message_assist_prefill_reasoning })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_REASONING)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+
+        // content continuation with no prior reasoning: the prompt still carries
+        // the forced empty think block
+        tst.test("world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .messages({ message_user, simple_assist_msg("Hello, ", "") })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_CONTENT)
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+    }
+
     // GLM-4.6 tests - format: <tool_call>function_name\n<arg_key>...</arg_key>\n<arg_value>...</arg_value>\n</tool_call>
     {
         auto tst = peg_tester("models/templates/GLM-4.6.jinja", detailed_debug);
@@ -4402,6 +4650,100 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .continue_final_message(COMMON_CHAT_CONTINUATION_REASONING)
             .expect_reasoning("I'm thinking")
             .expect_content("Hello, world!\nWhat's up?")
+            .run();
+    }
+
+    // Spark2.5 uses tagged arguments with forced-open thinking.
+    {
+        auto tst = peg_tester("models/templates/Spark2.5.jinja", detailed_debug);
+
+        tst.test("Hello, world!\nWhat's up?")
+            .enable_thinking(false)
+            .expect(message_assist)
+            .expect_reconstruction()
+            .run();
+
+        tst.test("I'm\nthinking</think>Hello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist_thoughts)
+            .expect_reconstruction()
+            .run();
+
+        tst.test(
+               "<tool_call>special_function"
+               "<arg_key>arg1</arg_key><arg_value>1</arg_value>"
+               "</tool_call>")
+            .enable_thinking(false)
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .expect_reconstruction()
+            .run();
+
+        tst.test(
+               "I'm\nthinking</think>"
+               "<tool_call>special_function"
+               "<arg_key>arg1</arg_key><arg_value>1</arg_value>"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect(message_assist_call_thoughts)
+            .expect_reconstruction()
+            .run();
+
+        tst.test(
+               "<tool_call>special_function"
+               "<arg_key>arg1</arg_key><arg_value>1</arg_value>"
+               "</tool_call>"
+               "<tool_call>special_function_with_opt"
+               "<arg_key>arg1</arg_key><arg_value>1</arg_value>"
+               "<arg_key>arg2</arg_key><arg_value>2</arg_value>"
+               "</tool_call>")
+            .enable_thinking(false)
+            .parallel_tool_calls(true)
+            .tools({ special_function_tool, special_function_tool_with_optional_param })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+                { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        tst.test(
+               "Preparing updates."
+               "<tool_call>magic_int"
+               "<arg_key>ref</arg_key><arg_value>42</arg_value>"
+               "<arg_key>name</arg_key><arg_value>上海</arg_value>"
+               "</tool_call>"
+               "<tool_call>amount"
+               "<arg_key>orig</arg_key><arg_value>2.5</arg_value>"
+               "</tool_call>"
+               "<tool_call>toggle"
+               "<arg_key>enabled</arg_key><arg_value>true</arg_value>"
+               "</tool_call>"
+               "<tool_call>set_config"
+               "<arg_key>config</arg_key><arg_value>{\"source\": \"spark\", \"options\": {\"strict\": true}}</arg_value>"
+               "</tool_call>"
+               "<tool_call>nested_args"
+               "<arg_key>tags</arg_key><arg_value>[\"alpha\", \"测试\"]</arg_value>"
+               "<arg_key>entries</arg_key><arg_value>[{\"id\": 1, \"label\": \"first\"}, {\"id\": 2, \"label\": \"第二\"}]</arg_value>"
+               "</tool_call>"
+               "<tool_call>empty_args"
+               "</tool_call>")
+            .enable_thinking(false)
+            .parallel_tool_calls(true)
+            .tools({ magic_int_tool, amount_tool, toggle_tool, config_tool, nested_args_tool, empty_args_tool })
+            .expect_content("Preparing updates.")
+            .expect_tool_calls({
+                { "magic_int", R"({"ref": 42, "name": "上海"})", {} },
+                { "amount", R"({"orig": 2.5})", {} },
+                { "toggle", R"({"enabled": true})", {} },
+                { "set_config", R"({"config": {"source": "spark", "options": {"strict": true}}})", {} },
+                { "nested_args", R"({"tags": ["alpha", "测试"], "entries": [{"id": 1, "label": "first"}, {"id": 2, "label": "第二"}]})", {} },
+                { "empty_args", "{}", {} },
+            })
+            .expect_reconstruction()
             .run();
     }
 
@@ -4975,6 +5317,13 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .enable_thinking(false)
             .tools({ empty_args_tool })
             .expect(simple_assist_msg("", "", "empty_args", "{}"))
+            .run();
+
+        // Tool call with no parameters schema, {} means no arguments
+        tst.test("<tool_call>\n{\"name\": \"empty_args_no_schema\", \"arguments\": {}}</tool_call>")
+            .enable_thinking(false)
+            .tools({ empty_args_tool_no_schema })
+            .expect(simple_assist_msg("", "", "empty_args_no_schema", "{}"))
             .run();
 
         // fake tool call marker in reasoning
