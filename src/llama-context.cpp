@@ -913,6 +913,7 @@ void llama_context::sched_reserve() {
         }
         ggml_backend_sched_set_sync_non_graph_inputs(result, sync_non_graph_inputs);
         ggml_backend_sched_set_copy_callback(result, sched_copy_experts, this);
+        ggml_backend_sched_set_prefetch_experts_slots(result, cparams.prefetch_experts_slots);
         return result;
     };
 

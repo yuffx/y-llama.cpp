@@ -2286,8 +2286,8 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
     ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
 
     ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
-    ggml_context * ctx_meta = ctx;
-    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+    for (int i = 0; i < n_tensors; i++) {
+        ggml_tensor * t = tensors[i];
         t->buffer = meta_buf;
         ggml_backend_meta_buffer_init_tensor_impl(meta_buf_ctx->stc_static, t);
         t->data = (void *) 0x2000000000000000; // FIXME
@@ -2319,7 +2319,8 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
             // tensors un-stamped, so llama reports "unable to allocate" and exits.
             GGML_LOG_ERROR("%s: failed to allocate the %s slice %zu of a meta buffer%c",
                 __func__, ggml_backend_buft_name(simple_buft), i, 10);
-            for (ggml_tensor * t = ggml_get_first_tensor(ctx_meta); t != nullptr; t = ggml_get_next_tensor(ctx_meta, t)) {
+            for (int t_id = 0; t_id < n_tensors; t_id++) {
+                ggml_tensor * t = tensors[t_id];
                 t->buffer = nullptr;
                 t->data   = nullptr;
             }
@@ -4470,12 +4471,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 node_zero->buffer = node->buffer;
                 node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
 
-            step_cgraphs[k] = get_cgraph_aux();
-            step_cgraphs[k]->nodes[0] = node_zero;
-            step_cgraphs[k]->n_nodes = 1;
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[k]);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
+                step_cgraphs[k] = get_cgraph_aux();
+                step_cgraphs[k]->nodes[0] = node_zero;
+                step_cgraphs[k]->n_nodes = 1;
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[k]);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
             }
         }
         std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
