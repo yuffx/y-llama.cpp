@@ -3718,9 +3718,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
 
-    ggml_tensor * q = q_cur;
-    ggml_tensor * k;
-    ggml_tensor * v;
+    // store to KV cache
+    {
+        const auto & k_idxs = inp->get_k_idxs();
+        const auto & v_idxs = inp->get_v_idxs();
 
         build_cpy_k(mctx_cur, k_cur, k_idxs, il);
         build_cpy_v(mctx_cur, v_cur, v_idxs, il);
