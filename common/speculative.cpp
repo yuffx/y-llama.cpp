@@ -1361,7 +1361,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             // an M-RoPE image pins all its rows to one position, so a windowed draft
             // cache cannot free cells for it - skip it, the draft can jump over the gap
-            const bool pos_pinned = batch_in.pos[i_batch_beg[seq_id]] == batch_in.pos[i_batch_end[seq_id]];
+            const bool pos_pinned = batch_in.pos[rows.front()] == batch_in.pos[rows.back()];
             if (has_embeddings && n_rows > 1 && pos_pinned) {
                 continue;
             }
