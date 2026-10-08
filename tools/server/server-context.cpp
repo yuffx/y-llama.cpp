@@ -59,6 +59,7 @@ static common_speculative_output_limits server_output_limits(const common_params
 static bool server_memory_can_checkpoint(llama_context * ctx) {
     llama_memory_t mem = llama_get_memory(ctx);
     return mem && mem->get_can_checkpoint();
+}
 
 // a checkpoint restore dropped tokens the target had accepted - re-accept them rather than verify again
 static std::vector<llama_token> server_accept_replay(
@@ -4124,15 +4125,15 @@ private:
         }
     }
 
-    bool reserve_prompt_graph(const llama_batch & batch_view) {
+    bool reserve_prompt_graph(const common_batch & batch_view) {
         static const bool enabled = []() {
             const char * value = getenv("LLAMA_DSPARK_PROMPT_RESERVE");
             return value == nullptr || atoi(value) != 0;
         }();
         if (!enabled || !spec || slots.size() != 1 || llama_n_seq_max(ctx_tgt) != 1 ||
                 params_base.split_mode != LLAMA_SPLIT_MODE_LAYER || llama_model_n_devices(model_tgt) < 2 ||
-                batch.has_embd || !batch_view.pos || batch_view.pos[0] != 0 ||
-                batch_view.n_tokens <= (int32_t) llama_n_ubatch(ctx_tgt) || !batch.tokens.front().is_prompt) {
+                batch.has_embd() || batch_view.tokens.empty() || batch_view.tokens.front().pos[0] != 0 ||
+                (int32_t) batch_view.size() <= (int32_t) llama_n_ubatch(ctx_tgt) || !batch.tokens.front().is_prompt) {
             return true;
         }
         const auto & types = params_base.speculative.types;
@@ -4156,6 +4157,64 @@ private:
         SLT_INF(slot, "DSpark prompt reserve end: ok=%d, %.3f ms including synchronization\n", ok,
                 (ggml_time_us() - start_us) / 1000.0);
         return ok;
+    }
+
+    // see https://github.com/ggml-org/llama.cpp/pull/29969
+    // TODO @ngxson : maybe remove this once we use "mixed" batch everywhere
+    bool use_mixed_batch() const {
+        return !llama_get_memory(ctx_tgt) || !llama_get_causal_attn(ctx_tgt);
+    }
+
+    // add the rest of the prompt to the batch, the mtmd chunks are added as embeddings next to the text tokens
+    // the caller makes sure that it fits in the batch
+    // returns false on error, the slot is then released
+    bool add_prompt_mixed(server_slot & slot) {
+        const auto & input_tokens = slot.task->tokens;
+        const auto n_tokens_prev = batch.size();
+
+        while (slot.prompt.n_tokens() < slot.task->n_tokens()) {
+            const auto cur_token_idx = slot.prompt.n_tokens();
+            const llama_token cur_tok = input_tokens[cur_token_idx];
+
+            if (cur_tok != LLAMA_TOKEN_NULL) {
+                const bool add_ok = batch.add(slot.id,
+                    cur_tok,
+                    /* pos       = */ slot.prompt.tokens.pos_next(),
+                    /* output    = */ slot.need_embd(),
+                    /* is_prompt = */ true);
+                GGML_ASSERT(add_ok);
+                if (!slot.task->decision.order.empty()) {
+                    batch.set_decision_order(batch.size() - 1, slot.task->decision.order[cur_token_idx]);
+                }
+                slot.prompt.tokens.push_back(cur_tok);
+                continue;
+            }
+
+            const auto & chunk = input_tokens.find_chunk(cur_token_idx);
+
+            float * embd = slot.mbatch ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
+            if (!embd) {
+                // encode on the worker thread, so we can still handle metrics tasks
+                int32_t res = 0;
+                queue_tasks.yield_to_queue([&]() {
+                    res = encode_mtmd_chunk(slot, slot.mbatch, cur_token_idx);
+                });
+                embd = res == 0 ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
+            }
+
+            if (!embd || !add_mtmd_chunk(slot, chunk.get(), embd, batch)) {
+                SLT_ERR(slot, "%s", "failed to process mtmd chunk\n");
+                // the batch must not keep the entries of a released slot
+                batch.truncate(n_tokens_prev);
+                send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
+                slot.release();
+                return false;
+            }
+
+            slot.prompt.tokens.push_back_placeholder(chunk.get());
+        }
+
+        return true;
     }
 
     // returns true = success ; false = retry with smaller batch size
@@ -4195,7 +4254,7 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
-            ret = reserve_prompt_graph(batch_view) ? llama_decode(ctx_tgt, batch_view) : -2;
+            ret = reserve_prompt_graph(batch.view) ? llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get()) : -2;
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
@@ -4448,6 +4507,14 @@ private:
                     accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
+                    accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                } else if (use_rejection) {
+                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                } else {
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                }
+
                 // logits row of each verify position, kept for the token probabilities below
                 slot.spec_i_batch_last = slot.spec_i_batch;
                 slot.spec_i_batch.clear();
