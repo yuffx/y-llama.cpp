@@ -3,6 +3,9 @@
 
 #include "build-info.h"
 #include "common.h"
+
+#include "../src/llama-ext.h"
+
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -14,6 +17,7 @@
 #include <cinttypes>
 #include <climits>
 #include <cmath>
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdlib>
@@ -47,11 +51,10 @@
 #include <io.h>
 #else
 #include <sys/ioctl.h>
-#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
-#if defined(__linux__)
+#if !defined(_WIN32)
 #include <sys/types.h>
 #include <pwd.h>
 #endif
@@ -295,6 +298,7 @@ void postprocess_cpu_params(common_cpu_params & cpuparams, const common_cpu_para
             cpuparams = *role_model;
         } else {
             cpuparams.n_threads = common_cpu_get_num_math();
+            cpuparams.auto_threads = true;
         }
     }
 
@@ -615,34 +619,6 @@ std::string string_from(const struct llama_context * ctx, const std::vector<llam
     return buf.str();
 }
 
-std::string string_from(const struct llama_context * ctx, const struct llama_batch & batch) {
-    std::stringstream buf;
-
-    buf << "[ ";
-
-    bool first = true;
-    for (int i = 0; i < batch.n_tokens; ++i) {
-        if (!first) {
-            buf << ", ";
-        } else {
-            first = false;
-        }
-
-        auto detokenized = common_token_to_piece(ctx, batch.token[i]);
-
-        buf << "\n"          << std::to_string(i)
-            << ", token '"   << detokenized << "'"
-            << ", pos "      << std::to_string(batch.pos[i])
-            << ", n_seq_id " << std::to_string(batch.n_seq_id[i])
-            << ", seq_id "   << std::to_string(batch.seq_id[i][0])
-            << ", logits "   << std::to_string(batch.logits[i]);
-    }
-
-    buf << " ]";
-
-    return buf.str();
-}
-
 void string_process_escapes(std::string & input) {
     std::size_t input_len = input.length();
     std::size_t output_idx = 0;
@@ -901,7 +877,7 @@ bool fs_validate_filename(const std::string & filename, bool allow_subdirs) {
 
 
 #ifdef _WIN32
-static std::wstring utf8_to_wstring(const std::string & str) {
+std::wstring utf8_to_wstring(const std::string & str) {
     if (str.empty()) {
         return std::wstring();
     }
@@ -917,82 +893,52 @@ static std::wstring utf8_to_wstring(const std::string & str) {
 
     return wstr;
 }
+
+std::string wstring_to_utf8(const std::wstring & str) {
+    if (str.empty()) {
+        return std::string();
+    }
+
+    int size = WideCharToMultiByte(CP_UTF8, 0, str.c_str(), (int)str.size(), NULL, 0, NULL, NULL);
+
+    if (size <= 0) {
+        return std::string();
+    }
+
+    std::string utf8(size, 0);
+    WideCharToMultiByte(CP_UTF8, 0, str.c_str(), (int)str.size(), &utf8[0], size, NULL, NULL);
+
+    return utf8;
+}
 #endif
 
-// returns true if successful, false otherwise
-bool fs_create_directory_with_parents(const std::string & path) {
-#ifdef _WIN32
-    std::wstring wpath = utf8_to_wstring(path);
+// returns the path as a UTF-8 string, preserving its separators
+std::string fs_path_to_utf8(const std::filesystem::path & path) {
+    const auto value = path.u8string();
+    return std::string(value.begin(), value.end());
+}
 
-    // if the path already exists, check whether it's a directory
-    const DWORD attributes = GetFileAttributesW(wpath.c_str());
-    if ((attributes != INVALID_FILE_ATTRIBUTES) && (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
-        return true;
+void fs_write_atomic(const std::filesystem::path & path, const std::string & data) {
+    std::error_code ec;
+    std::filesystem::path path_tmp = path;
+    path_tmp += ".tmp";
+
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(path.parent_path(), ec);
     }
 
-    size_t pos_slash = 0;
+    std::ofstream file(path_tmp, std::ios::binary);
+    file << data;
+    file.close();
 
-    // process path from front to back, procedurally creating directories
-    while ((pos_slash = path.find('\\', pos_slash)) != std::string::npos) {
-        const std::wstring subpath = wpath.substr(0, pos_slash);
-
-        pos_slash += 1;
-
-        // skip the drive letter, in some systems it can return an access denied error
-        if (subpath.length() == 2 && subpath[1] == ':') {
-            continue;
-        }
-
-        const bool success = CreateDirectoryW(subpath.c_str(), NULL);
-
-        if (!success) {
-            const DWORD error = GetLastError();
-
-            // if the path already exists, ensure that it's a directory
-            if (error == ERROR_ALREADY_EXISTS) {
-                const DWORD attributes = GetFileAttributesW(subpath.c_str());
-                if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        }
+    if (!file.fail()) {
+        std::filesystem::rename(path_tmp, path, ec);
     }
 
-    return true;
-#else
-    // if the path already exists, check whether it's a directory
-    struct stat info;
-    if (stat(path.c_str(), &info) == 0) {
-        return S_ISDIR(info.st_mode);
+    if (file.fail() || ec) {
+        std::filesystem::remove(path_tmp, ec);
+        throw std::runtime_error("failed to write file: " + fs_path_to_utf8(path));
     }
-
-    size_t pos_slash = 1; // skip leading slashes for directory creation
-
-    // process path from front to back, procedurally creating directories
-    while ((pos_slash = path.find('/', pos_slash)) != std::string::npos) {
-        const std::string subpath = path.substr(0, pos_slash);
-        struct stat info;
-
-        // if the path already exists, ensure that it's a directory
-        if (stat(subpath.c_str(), &info) == 0) {
-            if (!S_ISDIR(info.st_mode)) {
-                return false;
-            }
-        } else {
-            // create parent directories
-            const int ret = mkdir(subpath.c_str(), 0755);
-            if (ret != 0) {
-                return false;
-            }
-        }
-
-        pos_slash += 1;
-    }
-
-    return true;
-#endif // _WIN32
 }
 
 bool fs_is_directory(const std::string & path) {
@@ -1017,171 +963,90 @@ void common_set_env(const std::string & name, const std::string & value) {
 #endif
 }
 
-std::string fs_get_cache_directory() {
-    std::string cache_directory = "";
-    auto ensure_trailing_slash = [](std::string p) {
-        // Make sure to add trailing slash
-        if (p.empty() || p.back() != DIRECTORY_SEPARATOR) {
-            p += DIRECTORY_SEPARATOR;
-        }
-        return p;
-    };
-    cache_directory = common_get_env("LLAMA_CACHE");
-    if (cache_directory.empty()) {
-#if defined(__linux__) || defined(__FreeBSD__) || defined(_AIX) || \
-        defined(__OpenBSD__) || defined(__NetBSD__)
-        const std::string xdg_cache_home = common_get_env("XDG_CACHE_HOME");
-        const std::string home           = common_get_env("HOME");
-        if (!xdg_cache_home.empty()) {
-            cache_directory = xdg_cache_home;
-        } else if (!home.empty()) {
-            cache_directory = home + "/.cache/";
-        } else {
-#if defined(__linux__)
-            /* no $HOME is defined, fallback to getpwuid */
-            struct passwd *pw = getpwuid(getuid());
-            if ((!pw) || (!pw->pw_dir)) {
-                throw std::runtime_error("Failed to find $HOME directory");
-            }
-
-            cache_directory = std::string(pw->pw_dir) + std::string("/.cache/");
-#else /* defined(__linux__) */
-            throw std::runtime_error("Failed to find $HOME directory");
-#endif /* defined(__linux__) */
-        }
-#elif defined(__APPLE__)
-        cache_directory = common_get_env("HOME");
-        if (cache_directory.empty()) {
-            throw std::runtime_error("Failed to find $HOME directory");
-        }
-        cache_directory += "/Library/Caches/";
-#elif defined(_WIN32)
-        cache_directory = common_get_env("LOCALAPPDATA");
-        if (cache_directory.empty()) {
-            throw std::runtime_error("Failed to find %LOCALAPPDATA% directory");
-        }
-#elif defined(__EMSCRIPTEN__)
-        GGML_ABORT("not implemented on this platform");
+std::filesystem::path common_get_path_from_env(const std::string & name) {
+#if defined(_WIN32)
+    const std::wstring wname = utf8_to_wstring(name);
+    const wchar_t * wvalue = _wgetenv(wname.c_str());
+    return wvalue ? std::filesystem::path(wvalue) : std::filesystem::path();
 #else
-#  error Unknown architecture
+    const char * value = std::getenv(name.c_str());
+    return value ? std::filesystem::path(value) : std::filesystem::path();
 #endif
-        cache_directory = ensure_trailing_slash(cache_directory);
-        cache_directory += "llama.cpp";
-    }
-    return ensure_trailing_slash(cache_directory);
 }
 
-std::string fs_get_config_directory() {
-    std::string config_directory = "";
-    auto ensure_trailing_slash = [](std::string p) {
-        if (p.empty() || p.back() != DIRECTORY_SEPARATOR) {
-            p += DIRECTORY_SEPARATOR;
-        }
-        return p;
-    };
-#if defined(__linux__) || defined(__FreeBSD__) || defined(_AIX) || \
-        defined(__OpenBSD__) || defined(__NetBSD__) || defined(__APPLE__)
-    const std::string xdg_config_home = common_get_env("XDG_CONFIG_HOME");
-    const std::string home            = common_get_env("HOME");
-    if (!xdg_config_home.empty()) {
-        config_directory = xdg_config_home;
-    } else if (!home.empty()) {
-        config_directory = home + "/.config/";
-    } else {
-#if defined(__linux__)
-        /* no $HOME is defined, fallback to getpwuid */
-        struct passwd *pw = getpwuid(getuid());
-        if ((!pw) || (!pw->pw_dir)) {
-            throw std::runtime_error("Failed to find $HOME directory");
-        }
-
-        config_directory = std::string(pw->pw_dir) + std::string("/.config/");
-#else
-        throw std::runtime_error("Failed to find $HOME directory");
-#endif
+#if !defined(_WIN32)
+static std::filesystem::path get_home_directory() {
+    std::filesystem::path home = common_get_path_from_env("HOME");
+    if (!home.empty()) {
+        return home;
     }
-#elif defined(_WIN32)
-    config_directory = common_get_env("APPDATA");
+    const struct passwd * pw = getpwuid(getuid());
+    if (!pw || !pw->pw_dir || !*pw->pw_dir) {
+        throw std::runtime_error("Failed to find $HOME directory");
+    }
+    return pw->pw_dir;
+}
+#endif
+
+std::filesystem::path fs_get_cache_directory() {
+    std::filesystem::path cache_directory = common_get_path_from_env("LLAMA_CACHE");
+    if (!cache_directory.empty()) {
+        return cache_directory;
+    }
+#if defined(_WIN32)
+    cache_directory = common_get_path_from_env("LOCALAPPDATA");
+    if (cache_directory.empty()) {
+        throw std::runtime_error("Failed to find %LOCALAPPDATA% directory");
+    }
+#elif defined(__APPLE__)
+    cache_directory = get_home_directory() / "Library/Caches";
+#else
+    cache_directory = common_get_path_from_env("XDG_CACHE_HOME");
+    if (cache_directory.empty()) {
+        cache_directory = get_home_directory() / ".cache";
+    }
+#endif
+    return cache_directory / "llama.cpp";
+}
+
+std::filesystem::path fs_get_config_directory() {
+    std::filesystem::path config_directory;
+#if defined(_WIN32)
+    config_directory = common_get_path_from_env("APPDATA");
     if (config_directory.empty()) {
         throw std::runtime_error("Failed to find %APPDATA% directory");
     }
-#elif defined(__EMSCRIPTEN__)
-    // caller decides what to do when there is no config directory
-    throw std::runtime_error("not implemented on this platform");
 #else
-#  error Unknown architecture
+    config_directory = common_get_path_from_env("XDG_CONFIG_HOME");
+    if (config_directory.empty()) {
+        config_directory = get_home_directory() / ".config";
+    }
 #endif
-    config_directory = ensure_trailing_slash(config_directory);
-    config_directory += "llama.cpp";
-    return ensure_trailing_slash(config_directory);
+    return config_directory / "llama.cpp";
 }
 
-std::string fs_get_cache_file(const std::string & filename) {
+std::filesystem::path fs_get_cache_file(const std::string & filename) {
     GGML_ASSERT(filename.find(DIRECTORY_SEPARATOR) == std::string::npos);
-    std::string cache_directory = fs_get_cache_directory();
-    const bool success = fs_create_directory_with_parents(cache_directory);
-    if (!success) {
-        throw std::runtime_error("failed to create cache directory: " + cache_directory);
+    const std::filesystem::path cache_directory = fs_get_cache_directory();
+    std::error_code ec;
+    common_create_directories(cache_directory, ec);
+    if (ec) {
+        throw std::runtime_error("failed to create cache directory: " + fs_path_to_utf8(cache_directory));
     }
-    return cache_directory + filename;
-}
-
-std::vector<common_file_info> fs_list(const std::string & path, bool include_directories) {
-    std::vector<common_file_info> files;
-    if (path.empty()) return files;
-
-    std::filesystem::path dir(path);
-    if (!std::filesystem::exists(dir) || !std::filesystem::is_directory(dir)) {
-        return files;
-    }
-
-    for (const auto & entry : std::filesystem::directory_iterator(dir)) {
-        try {
-            // Only include regular files (skip directories)
-            const auto & p = entry.path();
-            if (std::filesystem::is_regular_file(p)) {
-                common_file_info info;
-                info.path   = p.string();
-                info.name   = p.filename().string();
-                info.is_dir = false;
-                try {
-                    info.size = static_cast<size_t>(std::filesystem::file_size(p));
-                } catch (const std::filesystem::filesystem_error &) {
-                    info.size = 0;
-                }
-                files.push_back(std::move(info));
-            } else if (include_directories && std::filesystem::is_directory(p)) {
-                common_file_info info;
-                info.path   = p.string();
-                info.name   = p.filename().string();
-                info.size   = 0; // Directories have no size
-                info.is_dir = true;
-                files.push_back(std::move(info));
-            }
-        } catch (const std::filesystem::filesystem_error &) {
-            // skip entries we cannot inspect
-            continue;
-        }
-    }
-
-    return files;
-}
-
-std::ifstream fs_open_ifstream(const std::string & fname, std::ios_base::openmode mode) {
-#ifdef _WIN32
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, fname.c_str(), -1, NULL, 0);
-    if (!wlen) { return std::ifstream(); }
-    std::vector<wchar_t> wfname(wlen);
-    (void)MultiByteToWideChar(CP_UTF8, 0, fname.c_str(), -1, wfname.data(), wlen);
-    return std::ifstream(wfname.data(), mode);
-#else
-    return std::ifstream(fname, mode);
-#endif
+    return cache_directory / std::filesystem::u8path(filename);
 }
 
 //
 // TTY utils
 //
+
+bool common_is_tty(FILE * file) {
+#if defined(_WIN32)
+    return _isatty(_fileno(file));
+#else
+    return isatty(fileno(file));
+#endif
+}
 
 bool tty_can_use_colors() {
     // Check NO_COLOR environment variable (https://no-color.org/)
@@ -1200,10 +1065,21 @@ bool tty_can_use_colors() {
 
     // Check if stdout and stderr are connected to a terminal
     // We check both because log messages can go to either
-    bool stdout_is_tty = isatty(fileno(stdout));
-    bool stderr_is_tty = isatty(fileno(stderr));
+    return common_is_tty(stdout) || common_is_tty(stderr);
+}
 
-    return stdout_is_tty || stderr_is_tty;
+bool tty_enable_ansi() {
+#if defined(_WIN32)
+    // a Windows console renders ANSI sequences only in virtual terminal mode, pipes and files take them as is
+    for (DWORD id : { STD_OUTPUT_HANDLE, STD_ERROR_HANDLE }) {
+        HANDLE h    = GetStdHandle(id);
+        DWORD  mode = 0;
+        if (GetConsoleMode(h, &mode) && !SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+            return false;
+        }
+    }
+#endif
+    return true;
 }
 
 //
@@ -1288,8 +1164,814 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+// --moe-expert-cache default (-2): a MoE model whose weights don't fit in free VRAM gets the
+// expert cache setup (experts in RAM, no repack, auto-sized cache, 2048 ubatch) so a plain
+// `-m model` runs the fast path; explicit user settings are kept
+// model file size, all splits (0 if unknown)
+
+// split.count as stored in the file; a key of another type (a malformed or foreign file) counts as an unsplit file instead of aborting in gguf_get_val_u16
+static uint32_t gguf_split_count(const struct gguf_context * gguf, int64_t id) {
+    return gguf_get_kv_type(gguf, id) == GGUF_TYPE_UINT16 ? gguf_get_val_u16(gguf, id) : 1;
+}
+
+static size_t common_model_file_size(const std::string & path_model) {
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context * gguf = gguf_init_from_file(path_model.c_str(), gp);
+    if (!gguf) {
+        return 0;
+    }
+    const int64_t id = gguf_find_key(gguf, "split.count");
+    const uint32_t n_split = id < 0 ? 1 : std::max<uint32_t>(1, gguf_split_count(gguf, id));
+    gguf_free(gguf);
+    size_t size = 0;
+    char prefix[4096], path[4096];
+    const bool split = n_split > 1 && llama_split_prefix(prefix, sizeof(prefix), path_model.c_str(), 0, n_split);
+    for (uint32_t i = 0; i < n_split; i++) {
+        if (split) {
+            llama_split_path(path, sizeof(path), prefix, i, n_split);
+        }
+        std::error_code ec;
+        const size_t s = std::filesystem::file_size(split ? std::string(path) : path_model, ec);
+        size += ec ? 0 : s;
+    }
+    return size;
+}
+
+// bytes of the routed-expert tensors (*_exps), over all splits: the rest of the file is what the GPU has to hold before a cache slot fits
+// bytes of the tensors that need no VRAM for the expert cache to fit: the experts and the (per-layer) token embeddings
+static size_t common_model_expert_bytes(const std::string & path_model) {
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context * g0 = gguf_init_from_file(path_model.c_str(), gp);
+    if (!g0) {
+        return 0;
+    }
+    const int64_t id = gguf_find_key(g0, "split.count");
+    const uint32_t n_split = id < 0 ? 1 : std::max<uint32_t>(1, gguf_split_count(g0, id));
+    gguf_free(g0);
+    char prefix[4096], path[4096];
+    const bool split = n_split > 1 && llama_split_prefix(prefix, sizeof(prefix), path_model.c_str(), 0, n_split);
+    size_t bytes = 0;
+    for (uint32_t k = 0; k < n_split; k++) {
+        if (split) {
+            llama_split_path(path, sizeof(path), prefix, k, n_split);
+        }
+        gguf_context * g = gguf_init_from_file(split ? path : path_model.c_str(), gp);
+        if (!g) {
+            continue;
+        }
+        for (int64_t t = 0; t < gguf_get_n_tensors(g); t++) {
+            // the experts, and the token embeddings: they stay in host memory (a lookup, one row per token, e.g. the 26.8 GiB per_layer_token_embd of Qwen3.8-Flash-Next),
+            // so neither counts against the VRAM the cache needs besides the non-expert weights
+            const char * name = gguf_get_tensor_name(g, t);
+            if (strstr(name, "_exps") || strstr(name, "token_embd")) {
+                bytes += gguf_get_tensor_size(g, t);
+            }
+        }
+        gguf_free(g);
+    }
+    return bytes;
+}
+
+// free memory summed over GPUs, of the largest GPU, and the GPU count
+static std::string g_gpu_id;       // the GPUs' names and PCI bus ids, hashed: identifies the hardware (and the slot, so the link) in the placement record
+static size_t g_gpu_total_max = 0; // fallback identity when the backend has no PCI id; free VRAM is not used: it moves with every browser tab
+
+// the slot of a GPU, "x16g4": negotiated link width (idle cards keep their width, only the speed drops) and the highest speed the card and its parent port
+// both support (the card alone says x16 in an x4 slot). Linux sysfs; empty: unknown
+static std::string common_pci_slot(const char * bus_id) {
+#ifdef __linux__
+    if (!bus_id || strlen(bus_id) < 12) { return ""; }
+    std::string id = bus_id + (strlen(bus_id) - 12);   // "0000:01:00.0" whether the backend wrote 4 or 8 domain digits
+    for (char & c : id) { c = (char) tolower((unsigned char) c); }
+    const std::string dir = "/sys/bus/pci/devices/" + id;
+    auto rd = [](const std::string & f) {
+        std::string v;
+        if (FILE * fp = fopen(f.c_str(), "r")) {
+            char b[64] = {0};
+            if (fgets(b, sizeof b, fp)) { v = b; }
+            fclose(fp);
+        }
+        while (!v.empty() && isspace((unsigned char) v.back())) { v.pop_back(); }
+        return v;
+    };
+    const std::string w = rd(dir + "/current_link_width");
+    if (w.empty() || w == "0") { return ""; }
+    double gts = atof(rd(dir + "/max_link_speed").c_str());   // "16.0 GT/s PCIe"
+    char real[PATH_MAX];
+    if (realpath(dir.c_str(), real)) {
+        std::string r = real;
+        const size_t cut = r.find_last_of('/');
+        if (cut != std::string::npos && cut > 0) {
+            const double pg = atof(rd(r.substr(0, cut) + "/max_link_speed").c_str());   // the parent port: the slot
+            if (pg > 0 && (gts <= 0 || pg < gts)) { gts = pg; }
+        }
+    }
+    const int gen = gts >= 32 ? 5 : gts >= 16 ? 4 : gts >= 8 ? 3 : gts >= 5 ? 2 : gts > 0 ? 1 : 0;
+    return "x" + w + "g" + std::to_string(gen);
+#else
+    GGML_UNUSED(bus_id);
+    return "";
+#endif
+}
+
+static void common_gpu_free(size_t & total, size_t & max, int & n) {
+    total = max = 0;
+    n = 0;
+    g_gpu_total_max = 0;
+    std::vector<std::string> ids;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        size_t free, tot;
+        ggml_backend_dev_memory(dev, &free, &tot);
+        total += free;
+        max    = std::max(max, free);
+        g_gpu_total_max = std::max(g_gpu_total_max, tot);
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        ids.push_back(std::string(ggml_backend_dev_name(dev)) + "|" + (props.device_id ? props.device_id : "") + "|" + common_pci_slot(props.device_id) + "|" + std::to_string(tot >> 30));
+        n++;
+    }
+    std::sort(ids.begin(), ids.end());   // the order the backend lists them in does not matter
+    uint32_t h = 2166136261u;            // FNV-1a: the same on every platform, so a state file can move with its machine
+    for (const auto & id : ids) { for (char c : id) { h = (h ^ (uint8_t) c) * 16777619u; } h *= 16777619u; }
+    g_gpu_id = string_format("%08x", h);
+    if (const char * lg = llama_moe_get_opt("log"); lg && strchr(lg, 'g')) {   // --moe log=g
+         for (const auto & id : ids) { LOG_INF("%s: GPU identity of the placement record: %s -> %s\n", __func__, id.c_str(), g_gpu_id.c_str()); } }
+}
+
+// RAM that can be used without swapping: Linux MemAvailable (free + reclaimable page cache), 0 if unknown
+// with_pool: also the free pages of a reserved huge page pool (1 GiB and 2 MiB, Linux): MemAvailable does not count them, but the pinned weights buffer is taken
+// from exactly those pages, so for the decision to pin they are available RAM (a 100 GiB pool left 21 GiB "available" and a 109 GiB model fell back to mmap)
+static size_t common_ram_available(bool with_pool = false) {
+#if defined(_WIN32)
+    GGML_UNUSED(with_pool);
+    MEMORYSTATUSEX st = {};
+    st.dwLength = sizeof(st);
+    return GlobalMemoryStatusEx(&st) ? (size_t) st.ullAvailPhys : 0;
+#elif defined(__linux__)
+    std::ifstream f("/proc/meminfo");
+    std::string key;
+    size_t kb = 0;
+    while (f >> key >> kb) {
+        if (key == "MemAvailable:") {
+            size_t pool = 0;
+            if (with_pool) {
+                for (const auto & hp : { std::make_pair("/sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages", (size_t) 1 << 30),
+                                         std::make_pair("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages",    (size_t) 2 << 20) }) {
+                    std::ifstream pf(hp.first);
+                    size_t n = 0;
+                    if (pf >> n) { pool += n * hp.second; }
+                }
+            }
+            if (with_pool) {   // a warm weights cache (GGML_CUDA_HUGEFS) holds pool pages already: its files are the pinned buffer the load maps, so they count too
+                if (const char * hd = getenv("GGML_CUDA_HUGEFS")) {
+                    std::error_code ec;
+                    for (const auto & e : std::filesystem::directory_iterator(hd, ec)) {
+                        if (e.is_regular_file(ec) && e.path().extension() == ".w") { pool += (size_t) e.file_size(ec); }
+                    }
+                }
+            }
+            return kb * 1024 + pool;
+        }
+        f.ignore(256, '\n');
+    }
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+// bytes swapped out since boot (Linux), to notice when pinning the weights pushed the system into swap
+static size_t common_swap_out_bytes() {
+#if defined(__linux__)
+    std::ifstream f("/proc/vmstat");
+    std::string key;
+    size_t n = 0;
+    while (f >> key >> n) {
+        if (key == "pswpout") {
+            return n * 4096;
+        }
+    }
+#endif
+    return 0;
+}
+
+// speculative defaults from model size vs free VRAM: the tuner's starting depth and, unless set,
+// the max draft depth (recurrent-state rollback buffers are sized by it, so it costs VRAM)
+void common_spec_auto(common_params & params) {
+    auto & dft = params.speculative.draft;
+    if (std::none_of(params.speculative.types.begin(), params.speculative.types.end(),
+                     [](auto t) { return t != COMMON_SPECULATIVE_TYPE_NONE; })) {
+        return;
+    }
+    size_t vram, vram_max;
+    int    n_gpu;
+    common_gpu_free(vram, vram_max, n_gpu);
+    const double ratio = vram ? (double) common_model_file_size(params.model.path) / vram : 1e9;
+    // measured: Qwen3.8-Flash-Next (1.9x VRAM, 95% cache hits) is fastest at 2, GLM-5.3-Flash (2.3x) at 0
+    dft.n_start = ratio <= 1 ? 3 : ratio <= 2 ? 2 : 0;
+    if (!dft.n_max_user) {
+        dft.n_max = ratio <= 1 ? 5 : 2; // bigger than VRAM: 2 measured best (Qwen); --spec-draft-n-max raises it
+    }
+    if (dft.n_start == 0 && !dft.n_max_user && params.speculative.has_dft()) {
+        // measured (GLM-5.3-Flash, 2.3x VRAM, separate -md draft with MoE experts): the draft's VRAM
+        // costs the expert cache more than drafting gains, even at depth 0; --spec-draft-n-max N
+        // loads it anyway. Built-in MTP (no -md) is kept: MiMo-V2.6 (2.8x VRAM, 3 dense MTP layers)
+        // measured +9% with it, so the depth tuner starts at 0 and measures instead.
+        LOG_WRN("%s: model is %.1fx free VRAM: speculative decoding would be slower here, not loading it "
+                "(--spec-draft-n-max N to force)\n", __func__, ratio);
+        params.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+        dft.mparams = {};
+        return;
+    }
+    LOG_INF("%s: model %.1fx free VRAM: draft depth starts at %d, max %d\n", __func__, ratio, dft.n_start, dft.n_max);
+}
+
+// Measured choice between the MoE expert cache and stock placement (the model fitter's layers, no cache), per model,
+// GPU set and build, without loading twice: one start runs stock placement, the next runs the cache, each records its prompt
+// and generation time per token at exit; then the faster mode is kept (file in the cache dir). The cache is kept only when
+// its generation is not slower than stock and its prompt time per token is below LLAMA_MOE_AUTO_PREFILL_SLOWDOWN (2) x stock.
+// LLAMA_MOE_AUTO_MODE=stock|cache forces a mode, =retest forgets the decision.
+struct moe_auto_rec { bool have = false; double p_ms = -1, g_ms = 0, g_max = 0, p_max = 0; int n = 0; int failed_mib = 0; std::vector<double> pr, gr; double last_p = -1, last_g = -1; }; // fastest and slowest per-token times seen (the spread is the noise), n: recorded runs; p_ms < 0: no prompt of real size measured yet; failed_mib: free VRAM (MiB) when it could not start (out of memory)
+static std::string g_moe_auto_file;  // decision file of this run (empty: auto choice not involved)
+static double g_moe_auto_np = 0, g_moe_auto_ng = 600; // the request profile of the decision, for the one made when this run is recorded
+static std::string g_moe_auto_mode;  // mode this run explores: "stock" or "cache" (empty: decided already)
+static size_t      g_moe_auto_vram_free = 0; // free VRAM when this run chose its placement
+
+// The placement records live in the engine's state file (llama_state_*, one INI section per model):
+//   [<model file> <bytes>]  place.g<gpus>x<GiB of the largest GPU>g.v2.stock|cache = <ms/prompt token> <ms/generated token> <runs>  and  .decided
+// moe_auto_path() returns "<section>\x1f<key prefix>"; the same section is handed to the engine for its own keys (hot experts, tuner)
+static std::string moe_auto_path(const common_params & params, size_t model_size, int n_gpu, size_t vram_max) {
+    std::string name = params.model.path;
+    const size_t sl = name.find_last_of("/\\");
+    if (sl != std::string::npos) { name = name.substr(sl + 1); }
+    for (auto & c : name) { if (c == '[' || c == ']' || c == '\n' || c == '\r') { c = '_'; } }
+    const std::string section = name + " " + std::to_string(model_size);
+    llama_state_set_model(section.c_str());
+    const std::string place = "place.g" + std::to_string(n_gpu) + "." + (g_gpu_id.empty() ? std::to_string(((g_gpu_total_max ? g_gpu_total_max : vram_max) + ((size_t) 1 << 29)) >> 30) + "g" : g_gpu_id) + ".v3";
+    llama_state_set_place(place.c_str());   // the engine keeps the seen link bandwidth under it
+    return section + "\x1f" + place; // v1: the placement rule's epoch, not the build, so a new release does not re-measure (LLAMA_MOE_AUTO_MODE=retest forgets)
+}
+
+static void moe_auto_split(const std::string & path, std::string & section, std::string & prefix) {
+    const size_t p = path.find('\x1f');
+    section = path.substr(0, p);
+    prefix  = p == std::string::npos ? "" : path.substr(p + 1);
+}
+
+// per-token times of the last runs of a placement (oldest first, at most 9) are kept next to the record: the value a decision uses is their median once there are
+// three (fewer: the fastest, so a cold first run never decides), the slowest is the noise, the last one shows drift
+static void moe_auto_refresh(moe_auto_rec & r) {
+    auto med_or_min = [](const std::vector<double> & v) {
+        std::vector<double> t = v;
+        std::sort(t.begin(), t.end());
+        return t.size() >= 3 ? t[t.size()/2] : t.front();
+    };
+    if (!r.gr.empty()) {
+        r.g_ms = med_or_min(r.gr);
+        r.g_max = *std::max_element(r.gr.begin(), r.gr.end());
+        r.last_g = r.gr.back();
+    }
+    if (!r.pr.empty()) {
+        r.p_ms = med_or_min(r.pr);
+        r.p_max = *std::max_element(r.pr.begin(), r.pr.end());
+        r.last_p = r.pr.back();
+    }
+}
+
+static std::vector<double> moe_auto_parse_list(const char * s) {
+    std::vector<double> v;
+    char * end = nullptr;
+    for (double x = strtod(s, &end); end != s; x = strtod(s, &end)) { v.push_back(x); s = end; }
+    return v;
+}
+
+static std::string moe_auto_list(const std::vector<double> & v) {
+    std::string o;
+    for (size_t i = 0; i < v.size(); ++i) { o += string_format(i ? " %.4f" : "%.4f", v[i]); }
+    return o;
+}
+
+static void moe_auto_read(const std::string & path, moe_auto_rec & st, moe_auto_rec & ca, std::string & decided) {
+    std::string section, prefix;
+    moe_auto_split(path, section, prefix);
+    char buf[128];
+    for (moe_auto_rec * r : { &st, &ca }) {
+        if (llama_state_get(section.c_str(), (prefix + (r == &st ? ".stock" : ".cache")).c_str(), buf, sizeof buf)) {
+            r->have = sscanf(buf, "%lf %lf %d %lf %lf %d", &r->p_ms, &r->g_ms, &r->n, &r->g_max, &r->p_max, &r->failed_mib) >= 3;
+            if (r->have && r->g_max < r->g_ms) { r->g_max = r->g_ms; }
+            if (r->have && r->p_max < r->p_ms) { r->p_max = r->p_ms; }
+            char lb[160];
+            const std::string base = prefix + (r == &st ? ".stock" : ".cache");
+            if (r->have && llama_state_get(section.c_str(), (base + ".g").c_str(), lb, sizeof lb)) { r->gr = moe_auto_parse_list(lb); }
+            if (r->have && llama_state_get(section.c_str(), (base + ".p").c_str(), lb, sizeof lb)) { r->pr = moe_auto_parse_list(lb); }
+            moe_auto_refresh(*r);
+        }
+    }
+    if (llama_state_get(section.c_str(), (prefix + ".decided").c_str(), buf, sizeof buf)) { decided = buf; }
+}
+
+static void moe_auto_write(const std::string & path, const moe_auto_rec & st, const moe_auto_rec & ca, const std::string & decided) {
+    std::string section, prefix;
+    moe_auto_split(path, section, prefix);
+    auto put = [&](const char * k, const moe_auto_rec & r) {
+        if (r.have || r.failed_mib) { llama_state_set(section.c_str(), (prefix + k).c_str(), string_format("%.4f %.4f %d %.4f %.4f %d", r.p_ms, r.g_ms, r.n, r.g_max, r.p_max, r.failed_mib).c_str()); } // p_ms -1: unknown
+    };
+    put(".stock", st);
+    put(".cache", ca);
+    for (const auto & kr : { std::make_pair(".stock", &st), std::make_pair(".cache", &ca) }) {
+        if (!kr.second->gr.empty()) { llama_state_set(section.c_str(), (prefix + kr.first + ".g").c_str(), moe_auto_list(kr.second->gr).c_str()); }
+        if (!kr.second->pr.empty()) { llama_state_set(section.c_str(), (prefix + kr.first + ".p").c_str(), moe_auto_list(kr.second->pr).c_str()); }
+    }
+    if (!decided.empty()) { llama_state_set(section.c_str(), (prefix + ".decided").c_str(), decided.c_str()); }
+}
+
+// the process could not start with the placement it was measuring (out of memory): record it with the free VRAM it saw, the other placement is used from the next start
+// on (until that much more VRAM is free than at the failure, e.g. another program that held it has gone)
+static void moe_auto_mark_failed() {
+    if (g_moe_auto_mode.empty()) {
+        return;
+    }
+    moe_auto_rec st, ca;
+    std::string decided;
+    moe_auto_read(g_moe_auto_file, st, ca, decided);
+    (g_moe_auto_mode == "stock" ? st : ca).failed_mib = std::max<int>(1, (int) (g_moe_auto_vram_free >> 20));
+    moe_auto_write(g_moe_auto_file, st, ca, decided);
+    LOG_ERR("%s: MoE placement: %s could not start with %.1f GiB of free VRAM, the other placement is used from the next start\n", __func__,
+        g_moe_auto_mode.c_str(), g_moe_auto_vram_free / 1073741824.0);
+    g_moe_auto_mode.clear();
+}
+
+// typical agentic coding turn when the command line says nothing (server, chat): the system prompt and tool definitions come from
+// the KV cache, so a turn adds ~2000 new prompt tokens (tool output, file contents) and generates ~600 (edits, tool calls)
+static double moe_auto_est_prompt(const common_params & params) {
+    return params.prompt.empty() ? 2000.0 : std::max(1.0, params.prompt.size() / 4.0);
+}
+
+static double moe_auto_est_gen(const common_params & params) {
+    return params.n_predict > 0 ? params.n_predict : 600.0;
+}
+
+// expected time of one request: cache wins when the generation it saves outweighs the prompt time it costs; prompt tokens are
+// estimated from the -p text (4 chars/token) and -n, else the agentic coding turn above, so a prompt of several thousand
+// tokens with a short answer picks stock and a short prompt with a long answer picks the cache
+// the prompt cost per token is only comparable once both placements measured a real prompt: a few tokens time the fixed setup cost,
+// and scaled to a server-sized prompt that picked stock for a cache that prefills 10x faster. Until then the prompt term drops out.
+static bool moe_auto_p_known(const moe_auto_rec & st, const moe_auto_rec & ca) { return st.p_ms >= 0 && ca.p_ms >= 0; }
+
+// The decision is made again on every start from everything recorded, so it can change its mind. Per placement the fastest per-token times
+// seen are kept (a cold run never decides) and the slowest too: their spread is the noise of that placement. A gap smaller than the noise
+// (at least 5%, and the 10% a single run is assumed to scatter by) keeps the previous decision, a clear gap changes it.
+static double moe_auto_cost(const moe_auto_rec & r, double np, double ng, bool p_known) { return (p_known ? np * r.p_ms : 0.0) + ng * r.g_ms; }
+
+static double moe_auto_noise(const moe_auto_rec & r) {
+    return r.n >= 2 && r.g_ms > 0 ? std::min(0.25, (r.g_max - r.g_ms) / r.g_ms) : 0.10;
+}
+
+// relative gap between the placements' request costs (positive: the cache is faster) and the noise bar it has to beat
+static double moe_auto_gap(const moe_auto_rec & st, const moe_auto_rec & ca, double np, double ng, double & bar) {
+    const bool pk = moe_auto_p_known(st, ca);
+    const double c = moe_auto_cost(ca, np, ng, pk), s = moe_auto_cost(st, np, ng, pk);
+    bar = std::max(0.05, std::max(moe_auto_noise(st), moe_auto_noise(ca)));
+    return (s - c) / std::max(1e-9, std::min(c, s));
+}
+
+static std::string moe_auto_choose(const moe_auto_rec & st, const moe_auto_rec & ca, double np, double ng, const std::string & prev) {
+    double bar = 0;
+    const double gap = moe_auto_gap(st, ca, np, ng, bar);
+    if ((prev == "cache" || prev == "stock") && std::fabs(gap) <= bar) { return prev; }
+    return gap >= 0 ? "cache" : "stock";
+}
+
+// the placement that is faster at one phase, "prefill" (p_ms) or generation (g_ms); a gap inside the noise keeps prev
+static std::string moe_auto_pick(const moe_auto_rec & st, const moe_auto_rec & ca, bool gen, const std::string & prev) {
+    if (!gen && !moe_auto_p_known(st, ca)) { return prev; }
+    const double s = gen ? st.g_ms : st.p_ms, c = gen ? ca.g_ms : ca.p_ms;
+    const double bar = std::max(0.05, std::max(moe_auto_noise(st), moe_auto_noise(ca)));
+    const double gap = (s - c) / std::max(1e-9, std::min(s, c));
+    if ((prev == "cache" || prev == "stock") && std::fabs(gap) <= bar) { return prev; }
+    return gap >= 0 ? "cache" : "stock";
+}
+
+// each recorded run refreshes the two picks (better prefill, better generation); they only set where the next start begins, every run
+// then measures and decides again
+static void moe_auto_store_picks(const std::string & path, const moe_auto_rec & st, const moe_auto_rec & ca) {
+    std::string sec, pre; moe_auto_split(path, sec, pre);
+    char b[16] = {0};
+    for (int gen = 0; gen < 2; ++gen) {
+        const std::string key = pre + (gen ? ".pick_g" : ".pick_p");
+        const std::string prev = llama_state_get(sec.c_str(), key.c_str(), b, sizeof b) ? b : "";
+        const std::string pick = moe_auto_pick(st, ca, gen, prev);
+        if (!pick.empty()) { llama_state_set(sec.c_str(), key.c_str(), pick.c_str()); }
+    }
+}
+
+static std::string moe_auto_decide_for(const moe_auto_rec & st, const moe_auto_rec & ca, const common_params & params, const std::string & path, const std::string & prev) {
+    const double np = moe_auto_p_known(st, ca) ? moe_auto_est_prompt(params) : 0.0;
+    const double ng = moe_auto_est_gen(params);
+    std::string mode = moe_auto_choose(st, ca, np, ng, prev);
+    {   // the recorded picks: where the two differ, the request decides which one counts (generation-heavy: generation over 10% longer than the prompt)
+        std::string sec, pre; moe_auto_split(path, sec, pre);
+        char b[16] = {0}, c[16] = {0};
+        const bool hp = llama_state_get(sec.c_str(), (pre + ".pick_p").c_str(), b, sizeof b);
+        const bool hg = llama_state_get(sec.c_str(), (pre + ".pick_g").c_str(), c, sizeof c);
+        if (hp && hg) {
+            const bool gen_heavy = ng * st.g_ms > 1.1 * np * std::max(0.0, st.p_ms);
+            mode = strcmp(b, c) == 0 ? b : gen_heavy ? c : b;
+            LOG_INF("%s: MoE placement: picks: prefill %s, generation %s; this request is %s-heavy -> %s\n", __func__, b, c, gen_heavy ? "generation" : "prefill", mode.c_str());
+        }
+    }
+    // switchover: the prompt length below which the cache wins for this many generated tokens
+    const double dp = ca.p_ms - st.p_ms, dg = st.g_ms - ca.g_ms;
+    const double breakeven = !moe_auto_p_known(st, ca) || dp <= 0 ? INFINITY : dg <= 0 ? 0.0 : ng * dg / dp;
+    LOG_INF("%s: MoE placement: request ~%.0f prompt + %.0f generated tokens; the cache wins for prompts under ~%.0f tokens at that answer length\n",
+        __func__, np, ng, breakeven);
+    return mode;
+}
+
+// one run of each placement decides when the CACHE wins by more than the noise; otherwise a second run of each is taken. The cache is never rejected on one run:
+// its first run starts with no learned hot experts (IQ3_S on 2x RTX 3090: 33-40 t/s cold, 53 t/s warm) and a decision "stock" is never revisited, so a cold first
+// trial would lock the model to stock speed for good
+static bool moe_auto_clear_gap(const moe_auto_rec & st, const moe_auto_rec & ca, const common_params & params) {
+    double bar = 0;
+    const double np = moe_auto_p_known(st, ca) ? moe_auto_est_prompt(params) : 0.0;
+    return moe_auto_gap(st, ca, np, moe_auto_est_gen(params), bar) > bar;
+}
+
+// -at off or --moe autotune=0: the kill switch for everything the engine tunes or measures by itself
+bool common_autotune_on(const common_params & params) {
+    return params.autotune;
+}
+
+// -ub from the request and the card, no VRAM tiers: the compute buffer of a ubatch is probed (no_alloc, per candidate) and what it
+// takes from the expert cache is weighed against the prefill time it saves.
+//   time per request, in decode-token units:  np / (PP_PER_TG * (ub/512)^PP_EXP)  +  ng * (1 + extra / cache_vram)
+// extra = compute buffer of this ubatch minus that of 512, cache_vram = VRAM left for cache slots; the decode loss is taken as
+// the share of cache slots lost. Constants measured: prefill grows with ub^0.6 (2.3x for 4x on a 16 GB card with experts in RAM,
+// 1.8x on 2x RTX 3090 and on OLMoE) and is ~11x the decode rate; np / ng are the request profile (-p / -n, else the agentic estimate).
+static uint32_t common_auto_ubatch(common_params & params) {
+    const double PP_EXP = 0.5, PP_PER_TG = 11.0;
+    const uint32_t cand[] = { 512, 1024, 2048 };
+    std::vector<size_t> compute(3, 0);
+    int64_t cache_vram = 0;
+    for (int i : { 0, 2 }) {  // the buffer is ~linear in ub: probe both ends, interpolate the middle
+        auto mp = common_model_params_to_llama(params);
+        auto cp = common_context_params_to_llama(params);
+        cp.n_ubatch = cand[i];
+        cp.n_batch  = std::max(cp.n_batch, cand[i]);
+        std::vector<ggml_backend_dev_t> devs;
+        uint32_t ngl = 0, nctx = 0, nexp = 0;
+        size_t sum = 0;
+        try {
+            const auto dmd = common_get_device_memory_data(params.model.path.c_str(), &mp, &cp, devs, ngl, nctx, nexp, GGML_LOG_LEVEL_ERROR);
+            for (size_t d = 0; d < devs.size() && d < dmd.size(); ++d) {   // the last entry of dmd is the host
+                sum += dmd[d].compute;
+                if (i == 0) {
+                    const int64_t target = d < params.fit_params_target.size() ? (int64_t) params.fit_params_target[d] : 0;
+                    cache_vram += std::max<int64_t>(0, dmd[d].free - (int64_t) (dmd[d].model + dmd[d].context + dmd[d].compute) - target);
+                }
+            }
+        } catch (const std::exception & e) {
+            COM_DBG("ubatch probe failed (%s), keeping %u\n", e.what(), cand[0]);
+            return cand[0];
+        }
+        compute[i] = sum;
+    }
+    if (cache_vram <= 0 || compute[2] <= compute[0]) {
+        return cand[0];
+    }
+    const double np = moe_auto_est_prompt(params), ng = moe_auto_est_gen(params);
+    uint32_t best = cand[0];
+    double t_best = 1e300;
+    for (uint32_t ub : cand) {
+        const double extra = (double) (compute[2] - compute[0]) * (ub - 512) / 1536.0;
+        const double t = np / (PP_PER_TG * std::pow(ub / 512.0, PP_EXP)) + ng * (1.0 + extra / (double) cache_vram);
+        COM_DBG("ubatch %u: extra buffer %.2f GiB of %.1f GiB cache VRAM, est. %.0f decode-token units\n", ub, extra / 1073741824.0, cache_vram / 1073741824.0, t);
+        if (t < t_best) { t_best = t; best = ub; }
+    }
+    LOG_INF("%s: ubatch %u (request ~%.0f prompt + %.0f generated tokens, compute buffer %.2f -> %.2f GiB at 512 -> 2048, %.1f GiB left for the cache)\n", __func__,
+        best, np, ng, compute[0] / 1073741824.0, compute[2] / 1073741824.0, cache_vram / 1073741824.0);
+    return best;
+}
+
+static void common_moe_cache_auto_impl(common_params & params);
+
+static void common_moe_cache_auto(common_params & params) {
+    common_moe_cache_auto_impl(params);
+    // VRAM the cache leaves free for the growth of the CUDA pools after load, which scales with the batch: measured at -ub 2048 (cache
+    // sized with a margin, 12k prompt, other margins aborting with CUDA out of memory): 54 MiB OLMoE, 74 IQ3_S, 170 GLM; ~15 at 512.
+    // 0.1 MiB per ubatch token is 1.2x the worst of them, floor 200: GLM aborted with out of memory at ub 512 with 51 (-at off keeps the 384 MiB default; --moe margin_mb=N overrides)
+    if (params.n_moe_cache_slots != 0 && common_autotune_on(params) && params.moe_opts.find("margin_mb") == std::string::npos &&
+        !llama_moe_get_opt("vram-reserve-mb")) {
+        params.moe_opts += (params.moe_opts.empty() ? "" : ",") + std::string("margin_mb=") + std::to_string(std::max(200, (int) std::ceil(0.1 * params.n_ubatch)));
+    }
+    COM_DBG("moe_cache_slots=%d ctx=%d batch=%d ubatch=%d threads=%d threads_batch=%d repack=%s ngl=%d tensor_overrides=%zu fit=%s\n",
+        params.n_moe_cache_slots, params.n_ctx, params.n_batch, params.n_ubatch, params.cpuparams.n_threads,
+        params.cpuparams_batch.n_threads, params.no_extra_bufts ? "off" : "on", params.n_gpu_layers,
+        (size_t) std::count_if(params.tensor_buft_overrides.begin(), params.tensor_buft_overrides.end(), [](const auto & o) { return o.pattern != nullptr; }),
+        params.fit_params ? "on" : "off");
+}
+
+static void common_moe_cache_auto_impl(common_params & params) {
+    if (params.n_moe_cache_slots != -2) {
+        COM_DBG("expert cache set by user (%d), no auto setup\n", params.n_moe_cache_slots);
+        return;
+    }
+    params.n_moe_cache_slots = 0;
+
+    const bool user_placement = params.n_gpu_layers != -1 ||
+        (!params.tensor_buft_overrides.empty() && params.tensor_buft_overrides[0].pattern != nullptr);
+    if (user_placement) {
+        COM_DBG("%s\n", "user tensor placement (-ngl/-ot/--cpu-moe), expert cache stays off unless --moe-expert-cache is set");
+        return;
+    }
+
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context * gguf = gguf_init_from_file(params.model.path.c_str(), gp);
+    if (!gguf) {
+        return;
+    }
+    auto get_uint = [&](const std::string & key) -> uint32_t {
+        const int64_t id = gguf_find_key(gguf, key.c_str());
+        if (id < 0) {
+            return 0;
+        }
+        switch (gguf_get_kv_type(gguf, id)) {
+            case GGUF_TYPE_UINT16: return gguf_get_val_u16(gguf, id);
+            case GGUF_TYPE_UINT32: return gguf_get_val_u32(gguf, id);
+            default:               return 0;
+        }
+    };
+    const int64_t arch_id = gguf_find_key(gguf, "general.architecture");
+    const std::string arch = arch_id < 0 ? "" : gguf_get_val_str(gguf, arch_id);
+    const uint32_t n_expert = get_uint(arch + ".expert_count");
+    gguf_free(gguf);
+    if (n_expert == 0) {
+        COM_DBG("%s\n", "not a MoE model, no expert cache");
+        return;
+    }
+
+    const size_t model_size = common_model_file_size(params.model.path);
+    size_t vram_free, vram_max;
+    int    n_gpu;
+    common_gpu_free(vram_free, vram_max, n_gpu);
+    // ponytail: weights vs free VRAM minus 1 GiB per GPU for context/compute; fit handles the borderline rest
+    const size_t reserve = (size_t) n_gpu << 30;
+    if (n_gpu == 0 || model_size + reserve <= vram_free) {
+        COM_DBG("MoE model (%.1f GiB) fits free VRAM (%.1f GiB on %d GPUs), no expert cache\n",
+            model_size / 1073741824.0, vram_free / 1073741824.0, n_gpu);
+        return;
+    }
+
+    bool use_cache = true;
+    {
+        const std::string path = moe_auto_path(params, model_size, n_gpu, vram_max);
+        const char * force = llama_moe_get_opt("mode");
+        const std::string f = force ? force : "";
+        if (f == "retest") { std::string sec, pre; moe_auto_split(path, sec, pre); llama_state_erase(sec.c_str(), pre.c_str()); }
+        moe_auto_rec st, ca;
+        std::string decided;
+        moe_auto_read(path, st, ca, decided);
+        std::string mode;
+        g_moe_auto_vram_free = vram_free;
+        // a placement that could not start counts as failed until a good deal more VRAM is free than when it failed
+        const bool st_failed = st.failed_mib > 0 && (double) vram_free < 1.25 * ((double) st.failed_mib * 1048576.0);
+        const bool ca_failed = ca.failed_mib > 0 && (double) vram_free < 1.25 * ((double) ca.failed_mib * 1048576.0);
+        // can the cache fit at all? Its slots come after the non-expert weights, the KV cache and the compute buffers; when those alone do not fit in the free VRAM
+        // there is no cache to measure (GLM 3.0-bit on one 3090 with 10.9 GiB free: out of memory)
+        const size_t expert_bytes = common_model_expert_bytes(params.model.path);
+        const size_t cache_need   = expert_bytes && model_size > expert_bytes ? model_size - expert_bytes + ((size_t) 3 << 29) + ((size_t) n_gpu << 28) : 0; // + 1.5 GiB + 0.25 GiB per GPU
+        if (f == "stock" || f == "cache") {
+            mode = f;
+        } else if (!common_autotune_on(params)) {
+            // no measuring: the static rule, cache whenever the model does not fit (and the prompt is not long); nothing is recorded
+            mode = moe_auto_est_prompt(params) < 3000 ? "cache" : "stock";
+            LOG_INF("%s: MoE placement: %s (autotune off: static rule, model %.1f GiB, free VRAM %.1f GiB)\n", __func__, mode.c_str(),
+                model_size / 1073741824.0, vram_free / 1073741824.0);
+        } else if (st_failed != ca_failed) {
+            mode = st_failed ? "cache" : "stock";
+            LOG_INF("%s: MoE placement: %s (the other placement could not start with this much free VRAM before; %s)\n", __func__, mode.c_str(), path.c_str());
+        } else if (cache_need > vram_free) {
+            mode = "stock";
+            LOG_INF("%s: MoE placement: stock (the cache cannot fit: about %.1f GiB for the non-expert weights, KV cache and compute buffers > free VRAM %.1f GiB)\n", __func__,
+                cache_need / 1073741824.0, vram_free / 1073741824.0);
+        } else if ((st.n >= 2 && ca.n >= 2) || (st.n >= 1 && ca.n >= 1 && moe_auto_clear_gap(st, ca, params))) {
+            // both placements measured on at least two runs (the first of each may be cold), or once each when one of them wins this
+            // request by more than 10%: decide for this request
+            mode = moe_auto_decide_for(st, ca, params, path, decided);
+            // while the cache wins, stock is measured again when the cache lost its edge: the last cache run was slower than the cache's own median by more than
+            // the noise bar (a changed machine, a lucky first run, a browser eating VRAM bandwidth). Decided at every start, a trial at most once in three starts.
+            {
+                std::string sec, pre; moe_auto_split(path, sec, pre);
+                char b[32] = {0};
+                int since = llama_state_get(sec.c_str(), (pre + ".since").c_str(), b, sizeof b) ? atoi(b) : 0;
+                const double bar = std::max(0.05, std::max(moe_auto_noise(st), moe_auto_noise(ca)));
+                const double off_g = (ca.last_g > 0 && ca.g_ms > 0) ? ca.last_g / ca.g_ms - 1.0 : 0.0;
+                const double off_p = (ca.last_p > 0 && ca.p_ms > 0) ? ca.last_p / ca.p_ms - 1.0 : 0.0;
+                // only stock is re-measured: it cannot be slower than stock, while another try of a losing cache could
+                if (mode == "cache" && since >= 2 && (off_g > bar || off_p > bar)) {
+                    mode = "stock"; since = 0;
+                    LOG_INF("%s: MoE placement: re-measuring stock this run (the last cache run was %.0f%% slower per %s token than its median, noise bar %.0f%%)\n", __func__,
+                        100.0 * std::max(off_g, off_p), off_g >= off_p ? "generated" : "prompt", 100.0 * bar);
+                } else {
+                    since = mode == "cache" ? since + 1 : 0;
+                }
+                llama_state_set(sec.c_str(), (pre + ".since").c_str(), std::to_string(since).c_str());
+            }
+            g_moe_auto_np = moe_auto_p_known(st, ca) ? moe_auto_est_prompt(params) : 0.0;
+            g_moe_auto_ng = moe_auto_est_gen(params);
+            // keep recording this placement: a cold first run (page cache, mmap) is replaced by any faster later run
+            g_moe_auto_file = path;
+            g_moe_auto_mode = mode;
+            LOG_INF("%s: MoE placement: %s (measured: stock %.2f/%.2f, cache %.2f/%.2f ms per prompt/generated token; %s)\n", __func__,
+                mode.c_str(), st.p_ms, st.g_ms, ca.p_ms, ca.g_ms, path.c_str());
+        } else {
+            // first run, nothing measured yet (PC1 IQ3_S 83 GB on one 24 GB GPU: stock 23.6 vs cache 42-49 t/s): the cache when the model is clearly bigger than the free VRAM (PC1 IQ1_M 54 GB on 2 x 24 GB: stock 108.9/60.4 vs cache 80.4/54.4 prompt/gen t/s); a prompt of thousands of tokens starts with stock, where the cache's slow prompt
+            // processing costs more than its faster generation gains; the measured runs then keep stock only where it is faster)
+            // first start: the cache when the model is clearly bigger than the free VRAM (under ~80% of it fits: the cache won on every such model measured, 1.2x
+            // to 2.4x on MiMo, GLM and Qwen Next, and records that never get written leave it on the usual winner), stock near the fit line (Qwen Next IQ1_M,
+            // 87% in VRAM: a tie). The other placement is measured on the next start and kept only when it wins by more than the noise bar.
+            const bool clearly_bigger = (double) model_size > 1.25 * (double) vram_free;
+            const std::string first = clearly_bigger ? "cache" : "stock";
+            // nothing is assumed from the model's size: both placements are measured on real requests (the cache first when the model is
+            // clearly bigger than the free VRAM, it wins there on every measured model; stock first otherwise), one run each when the gap is clear
+            // measuring: the placement with fewer recorded runs (ties: the first), so each gets two runs before it decides
+            mode = st.n == ca.n ? first : (st.n < ca.n ? "stock" : "cache");
+            if (clearly_bigger && mode == "stock") {
+                // not for a model clearly bigger than the free VRAM: the cache won 1.2x to 2.4x on every one measured, and the stock placement may not even start there
+                // (MiMo 132 GB and GLM 3.5-bit on 2 x 24 GB: cudaMalloc of a 27 GiB layer buffer fails, the second start of every new state died); the stock arm of a
+                // comparison is the stock build, or --moe mode=stock
+                mode = "cache";
+            }
+            g_moe_auto_file = path;
+            g_moe_auto_mode = mode;
+            LOG_INF("%s: MoE placement: measuring %s this run (stock %d runs, cache %d runs recorded; both need 2 before the faster one is kept%s; %s)\n", __func__,
+                mode.c_str(), st.n, ca.n, clearly_bigger ? "; stock is not tried: the model is clearly bigger than the free VRAM" : "", path.c_str());
+        }
+        use_cache = mode != "stock";
+    }
+
+    // stock placement (the model fitter places layers): only the expert cache and what exists for it stays off (experts on the
+    // CPU, repack disabled, cache slots, the big prompt batch that its uploads want); pinned weights and the thread choice stay
+    if (use_cache) {
+        auto & tbo = params.tensor_buft_overrides;
+        tbo.insert(std::find_if(tbo.begin(), tbo.end(), [](const auto & o) { return o.pattern == nullptr; }), llm_ffn_exps_cpu_override());
+        params.no_extra_bufts    = true;
+        params.n_moe_cache_slots = -1;
+    }
+    // pinned weights (no mmap, llama-server only: startup takes longer, pays off over many requests):
+    // cache uploads and prompt processing read them by direct DMA,
+    // measured +46% prompt processing, +3-5% decode on GLM-5.3-Flash; used whenever the model fits
+    // in RAM available now (no margin); common_init_result reloads with mmap if loading swaps
+    if (params.auto_pin && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
+        const size_t avail = common_ram_available(true);
+        if (avail && model_size <= avail) {
+            params.load_mode        = LLAMA_LOAD_MODE_NONE;
+            params.load_pinned_auto = true;
+        }
+    }
+    if (!params.ubatch_user && common_autotune_on(params)) {
+        params.n_ubatch = std::min<uint32_t>(params.n_batch, common_auto_ubatch(params));
+    }
+    // leave one core per GPU to drive it (measured on 2 GPUs: 6 of 8 cores beats 8)
+    for (auto * cp : { &params.cpuparams, &params.cpuparams_batch }) {
+        if (cp->auto_threads) {
+            cp->n_threads = std::max(2, cp->n_threads - n_gpu);
+        }
+    }
+    // resource saturator: compute threads on physical cores only (SMT siblings add no memory bandwidth), filled L3 domain
+    // by domain so each domain's threads compute its rows (GGML_MOE_CCX_SPLIT), leaving each domain's highest core to its
+    // L3 prefetch thread. Linux sysfs / Windows GetLogicalProcessorInformationEx; only without a user CPU mask (LLAMA_AUTO_PLACE=1).
+    // ponytail: no NUMA-node awareness yet, Windows processor group 0 only
+    if (!params.cpuparams.mask_valid && params.cpuparams.auto_threads && llama_moe_get_opt("auto-place") && atoi(llama_moe_get_opt("auto-place")) != 0) {
+        std::vector<std::vector<int>> dom; // physical cores (first SMT thread) per L3 domain
+#if defined(_WIN32)
+        DWORD len = 0;
+        GetLogicalProcessorInformationEx(RelationAll, nullptr, &len);
+        std::vector<char> buf(len);
+        if (len && GetLogicalProcessorInformationEx(RelationAll, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len)) {
+            std::vector<KAFFINITY> l3, cores; // processor group 0 only (<= 64 logical CPUs)
+            for (DWORD off = 0; off < len; ) {
+                auto * e = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) (buf.data() + off);
+                if (e->Relationship == RelationCache && e->Cache.Level == 3 && e->Cache.GroupMask.Group == 0) { l3.push_back(e->Cache.GroupMask.Mask); }
+                if (e->Relationship == RelationProcessorCore && e->Processor.GroupMask[0].Group == 0) { cores.push_back(e->Processor.GroupMask[0].Mask); }
+                off += e->Size;
+            }
+            for (KAFFINITY m : l3) {
+                std::vector<int> d;
+                for (KAFFINITY c : cores) {
+                    if (c != 0 && (c & m) == c) { int b = 0; while (!((c >> b) & 1)) { ++b; } d.push_back(b); }
+                }
+                std::sort(d.begin(), d.end());
+                if (!d.empty()) { dom.push_back(d); }
+            }
+            std::sort(dom.begin(), dom.end());
+        }
+#elif defined(__linux__)
+        auto rd = [](const std::string & path) { std::ifstream f(path); std::string v; std::getline(f, v); return v; };
+        auto parse = [](const std::string & list) {
+            std::vector<int> r;
+            std::stringstream ss(list);
+            std::string part;
+            while (std::getline(ss, part, ',')) {
+                const size_t d = part.find('-');
+                const int a0 = atoi(part.c_str()), b0 = d == std::string::npos ? a0 : atoi(part.c_str() + d + 1);
+                for (int k = a0; k <= b0; ++k) { r.push_back(k); }
+            }
+            return r;
+        };
+        std::vector<std::string> seen;
+        for (int cpu = 0; cpu < GGML_MAX_N_THREADS; ++cpu) {
+            const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu);
+            const std::string sib = rd(base + "/topology/thread_siblings_list");
+            if (sib.empty()) { break; }
+            const std::vector<int> sl = parse(sib);
+            if (sl.empty() || sl[0] != cpu) { continue; }
+            std::string l3 = rd(base + "/cache/index3/shared_cpu_list");
+            auto it = std::find(seen.begin(), seen.end(), l3);
+            if (it == seen.end()) { seen.push_back(l3); dom.emplace_back(); it = seen.end() - 1; }
+            dom[it - seen.begin()].push_back(cpu);
+        }
+#endif
+        const int n_dom = (int) dom.size();
+        const int nt = params.cpuparams.n_threads;
+        int avail = 0;
+        for (auto & d : dom) { avail += std::max<int>(0, (int) d.size() - 1); }
+        if (n_dom >= 1 && avail >= nt) {
+            // nt threads over the domains, contiguous per domain: domain d gets threads [d*nt/D, (d+1)*nt/D)
+            std::vector<int> places;
+            for (int d = 0; d < n_dom; ++d) {
+                const int want = (d + 1) * nt / n_dom - d * nt / n_dom;
+                for (int i = 0; i < want && i < (int) dom[d].size() - 1; ++i) { places.push_back(dom[d][i]); }
+            }
+            if ((int) places.size() == nt) {
+                for (auto * cp : { &params.cpuparams, &params.cpuparams_batch }) {
+                    std::fill(std::begin(cp->cpumask), std::end(cp->cpumask), false);
+                    for (int c : places) { cp->cpumask[c] = true; }
+                    cp->mask_valid = true;
+                    cp->strict_cpu = true;
+                }
+                // the static per-L3 row split only serves the L3 prefetch: alone it lost 19% on GLM (3700X, fixed rows
+                // per thread lose the dynamic chunking's load balance), while pinning itself was neutral (21.73 vs 21.53)
+                const char * l3pf = llama_moe_get_opt("l3-pf");
+                if (!getenv("GGML_MOE_CCX_SPLIT") && l3pf && atof(l3pf) > 0) {
+#if defined(_WIN32)
+                    _putenv_s("GGML_MOE_CCX_SPLIT", std::to_string(n_dom).c_str());
+#else
+                    setenv("GGML_MOE_CCX_SPLIT", std::to_string(n_dom).c_str(), 0);
+#endif
+                }
+                std::string pl;
+                for (int c : places) { pl += " " + std::to_string(c); }
+                LOG_INF("%s: %d compute threads on physical cores%s (%d L3 domains)\n", __func__, nt, pl.c_str(), n_dom);
+            }
+        }
+    }
+    if (params.n_ctx == 0) {
+        params.n_ctx = 32768; // ponytail: autofit would grow KV to n_ctx_train and starve the cache; -c N for more
+    }
+    LOG_INF("%s: MoE model (%.1f GiB) exceeds free VRAM (%.1f GiB): experts in RAM + GPU expert cache, no repack, "
+        "ctx %d, ubatch %d, threads %d, weights %s (settings you pass win)\n", __func__, model_size / 1073741824.0, vram_free / 1073741824.0,
+        params.n_ctx, params.n_ubatch, params.cpuparams.n_threads, params.load_pinned_auto ? "pinned" : "mmap");
+}
+
+static const std::map<common_decision_type, std::string> COMMON_DECISION_TYPE_NAMES = {
+    { COMMON_DECISION_TYPE_OPENJEV, "openjev" },
+    { COMMON_DECISION_TYPE_LEV,     "lev"     },
+    { COMMON_DECISION_TYPE_KEV,     "kev"     },
+    { COMMON_DECISION_TYPE_NIMBLE,  "nimble"  },
+    { COMMON_DECISION_TYPE_LAYA,    "laya"    },
+    { COMMON_DECISION_TYPE_CLEF,    "clef"    },
+};
+
+static common_decision_type common_decision_type_from_string(const std::string & str) {
+    for (const auto & pair : COMMON_DECISION_TYPE_NAMES) {
+        if (pair.second == str) {
+            return pair.first;
+        }
+    }
+    return COMMON_DECISION_TYPE_UNKNOWN;
+}
+
+common_decision_type common_get_decision_type(const struct llama_model * model) {
+    char buf[64];
+    if (llama_model_meta_val_str(model, "general.architecture", buf, sizeof(buf)) < 0) {
+        return COMMON_DECISION_TYPE_NONE;
+    }
+    const std::string key = std::string(buf) + ".decision.type";
+    if (llama_model_meta_val_str(model, key.c_str(), buf, sizeof(buf)) < 0) {
+        return COMMON_DECISION_TYPE_NONE;
+    }
+    return common_decision_type_from_string(buf);
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    common_moe_cache_auto(params);
+    common_spec_auto(params);
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1327,9 +2009,25 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
+    const size_t swap0 = params.load_pinned_auto ? common_swap_out_bytes() : 0;
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+    // real memory pressure, not the kernel moving idle pages of other programs to swap (zram)
+    const size_t swapped = params.load_pinned_auto ? common_swap_out_bytes() - swap0 : 0;
+    const size_t avail   = params.load_pinned_auto ? common_ram_available() : 0;
+    // no silent fallback to mmap: a pinned load that swapped or left little RAM is reported and the run goes on pinned (a different load mode behind the user's back
+    // gave unexplained t/s); a failed load is an error
+    if (params.load_pinned_auto && model != NULL && (swapped > (2ull << 30) || (avail && avail < (512ull << 20)))) {
+        LOG_WRN("%s: pinned weights left little RAM (swapped %.1f GiB, %.1f GiB RAM left); NOT falling back to mmap, expect swapping (use -lm mmap to choose mmap)\n", __func__,
+            swapped / 1073741824.0, avail / 1073741824.0);
+    }
     if (model == NULL) {
         return;
+    }
+    if (params.load_pinned_auto) {
+        LOG_INF("%s: weights pinned (swapped %.1f GiB while loading, %.1f GiB RAM left)\n", __func__,
+            swapped / 1073741824.0, avail / 1073741824.0);
+    } else {
+        LOG_INF("%s: weights NOT pinned: mmap / page cache (load mode %s)\n", __func__, llama_load_mode_name(params.load_mode));
     }
 
     pimpl->model.reset(model);
@@ -1339,6 +2037,29 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    // these decision models return a score for each token via the embeddings output
+    // TODO: maybe improve this in the future
+    const auto decision_type = common_get_decision_type(model);
+    if (decision_type == COMMON_DECISION_TYPE_LAYA || decision_type == COMMON_DECISION_TYPE_KEV || decision_type == COMMON_DECISION_TYPE_CLEF) {
+        params.embedding    = true;
+        params.pooling_type = LLAMA_POOLING_TYPE_NONE;
+
+        cparams.embeddings            = true;
+        cparams.pooling_type          = LLAMA_POOLING_TYPE_NONE;
+        cparams.n_outputs_max         = cparams.n_batch;
+        cparams.n_outputs_max_per_seq = 1;
+
+        LOG_INF("%s", "decision model reads the embeddings output, enabling embedding mode\n");
+    }
+
+    // embeddings need the whole batch in one ubatch, so n_batch must not be larger than n_ubatch
+    // (server.cpp does this check for --embedding, but before the model is loaded)
+    if (cparams.embeddings && cparams.n_batch > cparams.n_ubatch) {
+        LOG_WRN("embeddings enabled: setting n_batch = n_ubatch = %u\n", cparams.n_ubatch);
+        cparams.n_batch = cparams.n_ubatch;
+        params.n_batch  = params.n_ubatch;
+    }
 
     // load and optionally apply lora adapters
     for (auto & la : params.lora_adapters) {
@@ -1396,8 +2117,31 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    llama_moe_set_options((params.moe_opts + (common_autotune_on(params) ? "" : (params.moe_opts.empty() ? "autotune=0" : ",autotune=0"))).c_str());
     llama_context * lctx = llama_init_from_model(model, cparams);
+    // the compute buffers did not fit (a card near its limit): a smaller ubatch needs a smaller buffer, retry halving it; only an
+    // ubatch of ours, the user's -ub is respected. (A GPU fault at run time, Xid 31, kills the CUDA context and cannot be retried.)
+    while (lctx == NULL && !params.ubatch_user && cparams.n_ubatch > 128) {
+        cparams.n_ubatch /= 2;
+        LOG_WRN("%s: context creation failed, retrying with ubatch %u\n", __func__, cparams.n_ubatch);
+        lctx = llama_init_from_model(model, cparams);
+    }
+    // still no room: offloading host-weight ops to the GPU needs a staging buffer the size of a weight tensor on top of the compute buffers, which
+    // a card near its limit does not have; without it the same graph needs less (and ran faster at low VRAM share in our tests)
+    if (lctx == NULL && cparams.op_offload && !params.no_op_offload) {
+        cparams.op_offload = false;
+        LOG_WRN("%s: context creation failed, retrying without op offload\n", __func__);
+        lctx = llama_init_from_model(model, cparams);
+    }
+    if (lctx && params.cpuparams.auto_threads && common_autotune_on(params)) {
+        llama_set_thread_autotune(lctx, true); // the count came from the default, not from the user: tune it on measured decode time
+        if (!params.threads_batch_set) {
+            // likewise the batch count, on measured prompt batches, up to the logical cores (the batch pool is created that big)
+            llama_set_batch_thread_autotune(lctx, true, (int32_t) std::thread::hardware_concurrency());
+        }
+    }
     if (lctx == NULL) {
+        moe_auto_mark_failed();
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;
     }
@@ -1435,10 +2179,81 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+#if defined(__linux__)
+    // a user CPU mask (-C / -Cb): helper threads (loader, populate, probe, uploads) stay on those cores and their SMT siblings instead of the whole machine
+    if (!params.fork_off && (params.cpuparams.mask_valid || params.cpuparams_batch.mask_valid) && !getenv("LLAMA_HELPER_CPUS")) {
+        std::set<int> cpus;
+        for (const auto * cp : { &params.cpuparams, &params.cpuparams_batch }) {
+            if (!cp->mask_valid) { continue; }
+            for (int c = 0; c < GGML_MAX_N_THREADS; ++c) {
+                if (!cp->cpumask[c]) { continue; }
+                cpus.insert(c);
+                std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/thread_siblings_list");
+                std::string l; std::getline(f, l);
+                for (size_t pos = 0; pos < l.size(); ) {
+                    const int a = atoi(l.c_str() + pos); int b = a;
+                    const size_t d = l.find_first_of(",-", pos);
+                    if (d != std::string::npos && l[d] == '-') { b = atoi(l.c_str() + d + 1); }
+                    for (int i = a; i <= b; ++i) { cpus.insert(i); }
+                    const size_t nx = l.find(',', pos);
+                    if (nx == std::string::npos) { break; }
+                    pos = nx + 1;
+                }
+            }
+        }
+        std::string list;
+        for (int c : cpus) { list += (list.empty() ? "" : ",") + std::to_string(c); }
+        if (!list.empty()) { setenv("LLAMA_HELPER_CPUS", list.c_str(), 1); LOG_INF("%s: helper threads stay on the user CPU mask and its SMT siblings: %s\n", __func__, list.c_str()); }
+    }
+#endif
+    if (params.fork_off || !params.autotune) { // nothing is counted or saved
+        llama_moe_set_opt("observe", "0");
+    }
+    if (params.fork_off) { // --fork off wins over every other fork setting, whatever the order of the options
+        params.n_moe_cache_slots = 0;
+        params.autotune          = false;
+        params.auto_pin          = false;
+    }
+    const common_params orig = params; // before the placement and tuning below change it
     common_init_result_ptr res(new common_init_result(params, model_only));
+
+    // last resort: the fork could not even load or create a context (out of memory) where upstream stock would run. Free everything and start over
+    // with the fork off exactly as --moe cache=0 does (cache off, autotune off, the placement of upstream); not when the user forced a placement
+    if ((res->model() == NULL || (!model_only && res->context() == NULL)) && !llama_moe_get_opt("mode") &&
+        orig.n_moe_cache_slots != 0 && (orig.n_moe_cache_slots != -2 || common_autotune_on(orig))) {
+        moe_auto_mark_failed();
+        LOG_WRN("%s: initialisation failed, starting over with the fork off (as --moe cache=0)\n", __func__);
+        res.reset();                      // release the model and the memory before loading again
+        params = orig;
+        params.n_moe_cache_slots = 0;
+        params.autotune          = false;
+        res.reset(new common_init_result(params, model_only));
+    }
+
+    // the stock placement of the fitter does not fit either (MiMo 132 GB on 2 x 24 GB: it plans a 27 GiB buffer for a 24 GiB card with the default 1 GiB fit target; 4.5 GiB starts):
+    // once more with a larger fit target (+20% of each GPU's memory, at least 3 GiB: 4.5 and 8 GiB start MiMo, 4 GiB does not) before giving up
+    if ((res->model() == NULL || (!model_only && res->context() == NULL)) && params.fit_params && !llama_moe_get_opt("mode")) {
+        common_params retry = params;
+        size_t g = 0;
+        for (size_t i = 0; i < ggml_backend_dev_count() && g < retry.fit_params_target.size(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) { continue; }
+            size_t mem_free = 0, mem_total = 0;
+            ggml_backend_dev_memory(dev, &mem_free, &mem_total);
+            retry.fit_params_target[g++] += std::max<size_t>((size_t) 3 << 30, mem_total / 100 * 20);
+        }
+        if (g > 0) {
+            LOG_WRN("%s: the fitted placement does not fit, trying once more with a larger fit target (%zu MiB on the first GPU instead of %zu)\n", __func__,
+                retry.fit_params_target[0] >> 20, params.fit_params_target[0] >> 20);
+            res.reset();
+            params = retry;
+            res.reset(new common_init_result(params, model_only));
+        }
+    }
 
     llama_model * model = res->model();
     if (model == NULL) {
+        moe_auto_mark_failed();
         COM_ERR("failed to load model '%s'\n", params.model.path.c_str());
         return res;
     }
@@ -1449,6 +2264,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
     llama_context * lctx = res->context();
     if (lctx == NULL) {
+        moe_auto_mark_failed();
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return res;
     }
@@ -1528,7 +2344,8 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         }
 
         if (llama_model_has_encoder(model)) {
-            llama_encode(lctx, llama_batch_get_one(tmp.data(), tmp.size()));
+            common_batch batch = common_batch_get_one(lctx, tmp);
+            llama_process(lctx, LLAMA_PROCESS_TYPE_ENCODE, batch.get());
             llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
             if (decoder_start_token_id == LLAMA_TOKEN_NULL) {
                 decoder_start_token_id = bos;
@@ -1537,7 +2354,13 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             tmp.push_back(decoder_start_token_id);
         }
         if (llama_model_has_decoder(model)) {
-            llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch)));
+            llama_moe_cache_defer(lctx, true); // start the cache on the first real decode
+            tmp.resize(std::min(tmp.size(), (size_t) params.n_batch));
+            common_batch batch = common_batch_get_one(lctx, tmp);
+            llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            llama_synchronize(lctx);
+            llama_memory_clear(llama_get_memory(lctx), true);
+            llama_moe_cache_defer(lctx, false);
         }
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
@@ -1550,7 +2373,59 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     return res;
 }
 
-common_init_result::~common_init_result() = default;
+common_init_result::~common_init_result() {
+    if (g_moe_auto_mode.empty() || !pimpl || !pimpl->context) {
+        return;
+    }
+    const llama_perf_context_data pd = llama_perf_context(pimpl->context.get());
+    // the generation time decides what is recorded; the prompt time is only taken from real prompts (128+ tokens, below), so a short chat prompt
+    // (GLM 3.5-bit short game prompt: 6 prompt tokens) still records its run: before, every stock start of such a request was thrown away and measured again
+    if (pd.n_eval < 32) {
+        LOG_INF("%s: MoE placement: too few tokens this run to record %s (%d prompt, %d generated)\n", __func__,
+            g_moe_auto_mode.c_str(), pd.n_p_eval, pd.n_eval);
+        return;
+    }
+    moe_auto_rec st, ca;
+    std::string decided;
+    moe_auto_read(g_moe_auto_file, st, ca, decided);
+    moe_auto_rec & r = g_moe_auto_mode == "stock" ? st : ca;
+    // the fastest per-token times seen: a cold run (model not in the page cache yet) never outweighs a warm one
+    const double g_ms = pd.t_eval_ms / pd.n_eval;
+    // stale state guard: what the cache learned (hot experts, tuner values) can go stale (another workload, state left by another build). A cache run
+    // whose generation is more than 15% slower than the best this placement ever did, twice in a row, erases the model's learned state, so the next
+    // starts relearn it. The stock record is kept; a single slow run (thermal, other load, a longer context) only counts a strike.
+    if (g_moe_auto_mode == "cache" && r.have && r.n >= 2 && pd.n_eval >= 64) {
+        std::string sec, pre; moe_auto_split(g_moe_auto_file, sec, pre);
+        char b[16] = {0};
+        int strikes = llama_state_get(sec.c_str(), (pre + ".strikes").c_str(), b, sizeof b) ? atoi(b) : 0;
+        strikes = g_ms > 1.15 * r.g_ms ? strikes + 1 : 0;
+        if (strikes >= 2) {
+            LOG_INF("%s: MoE state looked stale (generation %.2f ms per token, best %.2f, twice in a row): erasing what was learned for this model, it relearns from the next start\n",
+                __func__, g_ms, r.g_ms);
+            llama_state_erase(sec.c_str(), "");
+            moe_auto_write(g_moe_auto_file, st, moe_auto_rec(), "");
+            llama_state_suppress_writes(true);   // marked for deletion: the engine's save when the context is freed (hot experts, tuner values, threads) writes nothing
+            return;
+        }
+        llama_state_set(sec.c_str(), (pre + ".strikes").c_str(), std::to_string(strikes).c_str());
+    }
+    if (r.gr.empty() && r.have) { r.gr = { r.g_ms, r.g_max }; if (r.g_max == r.g_ms) { r.gr.pop_back(); } }   // a record from before the sample lists: its best and worst seed them
+    if (r.pr.empty() && r.have && r.p_ms >= 0) { r.pr = { r.p_ms, r.p_max }; if (r.p_max == r.p_ms) { r.pr.pop_back(); } }
+    if (pd.n_p_eval >= 128) { r.pr.push_back(pd.t_p_eval_ms / pd.n_p_eval); }   // a real prompt: per-token prompt cost (a few tokens would only time the fixed setup)
+    r.gr.push_back(g_ms);
+    if (r.pr.size() > 9) { r.pr.erase(r.pr.begin(), r.pr.end() - 9); }
+    if (r.gr.size() > 9) { r.gr.erase(r.gr.begin(), r.gr.end() - 9); }
+    r.have = true;
+    moe_auto_refresh(r);
+    r.n++;
+    if (st.have && ca.have) {
+        moe_auto_store_picks(g_moe_auto_file, st, ca);
+        decided = moe_auto_choose(st, ca, moe_auto_p_known(st, ca) ? g_moe_auto_np : 0.0, g_moe_auto_ng, decided);
+        LOG_INF("%s: MoE placement decided: %s (stock %.2f/%.2f, cache %.2f/%.2f ms per prompt/generated token)\n", __func__,
+            decided.c_str(), st.p_ms, st.g_ms, ca.p_ms, ca.g_ms);
+    }
+    moe_auto_write(g_moe_auto_file, st, ca, decided);
+}
 
 std::string common_get_model_endpoint() {
     std::string endpoint = common_get_env("MODEL_ENDPOINT");
@@ -1601,9 +2476,13 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     tmp.push_back(0);
     tmp.push_back(0);
 
-    int ret = llama_decode(ctx, llama_batch_get_one(tmp.data(), tmp.size()));
+    int ret;
+    {
+        common_batch batch = common_batch_get_one(ctx, tmp);
+        ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+    }
     if (ret != 0) {
-        COM_ERR("llama_decode() failed: %d\n", ret);
+        COM_ERR("llama_process() failed: %d\n", ret);
         res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
         goto done;
     }
@@ -1753,7 +2632,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
-    mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     return mparams;
 }
@@ -1768,6 +2647,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
+    cparams.n_moe_cache_slots   = params.n_moe_cache_slots == -2 ? 0 : params.n_moe_cache_slots;
+    cparams.n_moe_cache_inserts = params.n_moe_cache_inserts;
+    cparams.n_moe_cache_window  = params.n_moe_cache_window;
+    cparams.n_moe_predict       = params.n_moe_predict;
+    cparams.n_moe_predict_train = params.n_moe_predict_train;
     cparams.n_threads         = params.cpuparams.n_threads;
     cparams.n_threads_batch   = params.cpuparams_batch.n_threads == -1 ?
                                 params.cpuparams.n_threads : params.cpuparams_batch.n_threads;
@@ -1788,6 +2672,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
+    cparams.prefetch_experts_slots = params.prefetch_experts_slots;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
 
@@ -1842,6 +2727,11 @@ void common_threadpools::init(llama_context * ctx, const common_params & params)
 
     struct ggml_threadpool_params tpp_batch =
             ggml_threadpool_params_from_cpu_params(params.cpuparams_batch);
+    if (params.cpuparams.auto_threads && !params.threads_batch_set) {
+        // the batch tuner may use up to the logical cores: size the batch pool for it, so it differs from the decode pool
+        // (graph_compute uses n_threads_batch of them, the rest idle)
+        tpp_batch.n_threads = std::max(tpp_batch.n_threads, (int) std::thread::hardware_concurrency());
+    }
     struct ggml_threadpool_params tpp =
             ggml_threadpool_params_from_cpu_params(params.cpuparams);
 
@@ -1867,33 +2757,6 @@ void common_threadpools::init(llama_context * ctx, const common_params & params)
     }
 
     llama_attach_threadpool(ctx, threadpool, threadpool_batch);
-}
-
-//
-// Batch utils
-//
-
-void common_batch_clear(struct llama_batch & batch) {
-    batch.n_tokens = 0;
-}
-
-void common_batch_add(
-                 struct llama_batch & batch,
-                        llama_token   id,
-                          llama_pos   pos,
-    const std::vector<llama_seq_id> & seq_ids,
-                               bool   logits) {
-    GGML_ASSERT(batch.seq_id[batch.n_tokens] && "llama_batch size exceeded");
-
-    batch.token   [batch.n_tokens] = id;
-    batch.pos     [batch.n_tokens] = pos;
-    batch.n_seq_id[batch.n_tokens] = seq_ids.size();
-    for (size_t i = 0; i < seq_ids.size(); ++i) {
-        batch.seq_id[batch.n_tokens][i] = seq_ids[i];
-    }
-    batch.logits  [batch.n_tokens] = logits;
-
-    batch.n_tokens++;
 }
 
 //
@@ -2232,18 +3095,140 @@ float lr_opt::get_lr(float epoch) const {
 }
 
 bool common_replay_last_token(struct llama_context * ctx, llama_token last_token, int32_t pos) {
-    llama_batch batch = llama_batch_get_one(&last_token, 1);
-    batch.pos = &pos;
-    if (llama_decode(ctx, batch)) {
+    common_batch batch(ctx);
+    batch.add(last_token, pos, 0, true);
+
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
         LOG_ERR("%s: failed to replay last token\n", __func__);
         return false;
     }
     return true;
 }
 
+common_batch::common_batch(llama_context * ctx) : batch(llama_batch_ext_init(ctx)) {
+    const auto rope_type = llama_model_rope_type(llama_get_model(ctx));
+    n_pos = rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE ? GGML_MROPE_SECTIONS : 1;
+}
+
+void common_batch::clear() {
+    tokens.clear();
+}
+
+int32_t common_batch::add(llama_token id, llama_pos pos, llama_seq_id seq_id, bool output) {
+    tokens.push_back({ id, { pos, 0, 0, 0 }, seq_id, output, { nullptr, 0, 0 }, {} });
+    return size() - 1;
+}
+
+int32_t common_batch::add(llama_token id, llama_pos pos, const std::vector<llama_seq_id> & seq_ids, bool output) {
+    GGML_ASSERT(!seq_ids.empty());
+
+    const int32_t idx = add(id, pos, seq_ids[0], output);
+    for (size_t s = 1; s < seq_ids.size(); ++s) {
+        add_seq(idx, seq_ids[s]);
+    }
+    return idx;
+}
+
+bool common_batch::add_seq(int32_t idx, llama_seq_id seq_id) {
+    if (idx < 0 || idx >= size()) {
+        return false;
+    }
+    tokens[idx].seq_ids_extra.push_back(seq_id);
+    return true;
+}
+
+bool common_batch::set_output(int32_t idx, bool value) {
+    if (idx < 0 || idx >= size()) {
+        return false;
+    }
+    tokens[idx].output = value;
+    return true;
+}
+
+bool common_batch::set_embd(int32_t idx, llama_embd embd) {
+    if (idx < 0 || idx >= size() || tokens[idx].embd.data != nullptr) {
+        return false;
+    }
+    tokens[idx].embd = embd;
+    return true;
+}
+
+int32_t common_batch::add_embd(llama_embd embd, const llama_pos * pos, llama_seq_id seq_id, bool output) {
+    token t = { LLAMA_TOKEN_NULL, { 0, 0, 0, 0 }, seq_id, output, embd, {} };
+    for (int32_t j = 0; j < n_pos; ++j) {
+        t.pos[j] = pos[j];
+    }
+    tokens.push_back(t);
+    return size() - 1;
+}
+
+llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
+    GGML_ASSERT(batch && "common_batch was not initialized with a context");
+    GGML_ASSERT(off >= 0 && n >= 0 && off + n <= size());
+
+    llama_batch_ext * res = batch.get();
+    llama_batch_ext_clear(res);
+
+    for (int32_t i = off; i < off + n; ++i) {
+        const token & t = tokens[i];
+
+        int32_t idx;
+        if (t.id != LLAMA_TOKEN_NULL) {
+            idx = llama_batch_ext_add_token(res, t.seq_id, t.id);
+            if (idx < 0) {
+                GGML_ABORT("%s: failed to add token %d at index %d (error %d, n = %d)\n", __func__, t.id, i, idx, n);
+            }
+            llama_batch_ext_set_pos(res, idx, t.pos.data());
+            if (t.embd.data && !llama_batch_ext_set_embd_token(res, idx, t.embd)) {
+                GGML_ABORT("%s: failed to set the embedding of token %d at index %d\n", __func__, t.id, i);
+            }
+        } else {
+            idx = llama_batch_ext_add_embd(res, t.seq_id, t.embd);
+            if (idx < 0) {
+                GGML_ABORT("%s: failed to add embedding at index %d (error %d, n = %d)\n", __func__, i, idx, n);
+            }
+            llama_batch_ext_set_pos(res, idx, t.pos.data());
+        }
+        GGML_ASSERT(idx == i - off);
+
+        for (const llama_seq_id seq_id : t.seq_ids_extra) {
+            if (!llama_batch_ext_add_seq(res, idx, seq_id)) {
+                GGML_ABORT("%s: failed to add seq %d to the entry at index %d\n", __func__, seq_id, i);
+            }
+        }
+        if (t.output) {
+            llama_batch_ext_set_output_logits(res, idx, true);
+        }
+        if (t.decision_order != 0) {
+            llama_batch_ext_set_decision_order(res, idx, (llama_decision_order) t.decision_order);
+        }
+    }
+
+    return res;
+}
+
+common_batch common_batch_get_one(llama_context * ctx, const llama_token * tokens, int32_t n_tokens) {
+    common_batch batch(ctx);
+
+    auto mem = llama_get_memory(ctx);
+    llama_pos pos = llama_memory_seq_pos_max(mem, 0) + 1; // -1 + 1 == 0 when the memory is empty
+
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        const bool output = i == n_tokens - 1;
+        batch.add(tokens[i], pos, 0, output);
+        pos++;
+    }
+
+    return batch;
+}
+
+common_batch common_batch_get_one(llama_context * ctx, const llama_tokens & tokens) {
+    return common_batch_get_one(ctx, tokens.data(), (int32_t) tokens.size());
+}
+
 bool common_prompt_batch_decode(
               struct llama_context * ctx,
-    const std::vector<llama_token> & all_tokens,
+                const llama_tokens & all_tokens,
                                int   n_new,
                                int & n_past,
                                int   n_batch,
@@ -2264,7 +3249,9 @@ bool common_prompt_batch_decode(
         // Memory implementations in recurrent/hybrid models don't support removing tokens from their
         // memory, so we can't just remove the last token from the memory and replay the last token which
         // is the reason for this logic.
-        if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token*>(all_tokens.data() + offset), n_tokens_before_last))) {
+        llama_tokens prefix_tokens(all_tokens.begin() + offset, all_tokens.begin() + offset + n_tokens_before_last);
+        common_batch batch_prefix = common_batch_get_one(ctx, prefix_tokens);
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch_prefix.get())) {
             COM_ERR("%s", "failed to eval\n");
             return false;
         }
@@ -2273,18 +3260,18 @@ bool common_prompt_batch_decode(
         llama_state_save_file(ctx, state_path.data(), all_tokens.data(), all_tokens.size());
         COM_INF("saved session before last token to %s, n_new = %zu\n", state_path.data(), all_tokens.size());
 
-        llama_token last_token = all_tokens.back();
-        llama_batch batch = llama_batch_get_one(&last_token, 1);
-        int32_t pos = n_past;
-        batch.pos = &pos;
+        common_batch batch_last(ctx);
+        batch_last.add(all_tokens.back(), n_past, 0, true);
 
-        if (llama_decode(ctx, batch)) {
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch_last.get())) {
             COM_ERR("%s", "failed to eval last token\n");
             return false;
         }
         n_past++;
     } else {
-        if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token*>(all_tokens.data() + offset), n_new))) {
+        llama_tokens new_tokens(all_tokens.begin() + offset, all_tokens.begin() + offset + n_new);
+        common_batch batch = common_batch_get_one(ctx, new_tokens);
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
             COM_ERR("%s", "failed to eval\n");
             return false;
         }

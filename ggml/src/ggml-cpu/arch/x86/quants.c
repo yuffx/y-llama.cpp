@@ -698,6 +698,124 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+    const int qk = QK2_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    // one 512-bit register per Q2_0 block: 128-bit lanes 0/1 hold the first half (bytes 0-3 / 4-7, each repeated in the
+    // four dwords), lanes 2/3 the second half (bytes 8-11 / 12-15); dword d shifted right by 2d and masked gives weight
+    // 4p+d at lane byte 4d+p (as in the AVX2 path); vpdpbusd sums u8 weights x s8 activations per dword
+    const __m512i xidx = _mm512_set_epi8(
+        15,14,13,12,15,14,13,12,15,14,13,12,15,14,13,12, 11,10,9,8,11,10,9,8,11,10,9,8,11,10,9,8,
+        7,6,5,4,7,6,5,4,7,6,5,4,7,6,5,4, 3,2,1,0,3,2,1,0,3,2,1,0,3,2,1,0);
+    const __m512i yidx = _mm512_set_epi8(
+        15,11,7,3,14,10,6,2,13,9,5,1,12,8,4,0, 15,11,7,3,14,10,6,2,13,9,5,1,12,8,4,0,
+        15,11,7,3,14,10,6,2,13,9,5,1,12,8,4,0, 15,11,7,3,14,10,6,2,13,9,5,1,12,8,4,0);
+    const __m512i shifts = _mm512_set_epi32(6,4,2,0, 6,4,2,0, 6,4,2,0, 6,4,2,0);
+    const __m512i m3     = _mm512_set1_epi8(3);
+    const __m512i ones   = _mm512_set1_epi8(1);
+
+    __m512 acc = _mm512_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const __m512i qq = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) x[i].qs));
+        const __m512i xv = _mm512_and_si512(_mm512_srlv_epi32(_mm512_shuffle_epi8(qq, xidx), shifts), m3); // {0..3}
+        const __m512i yr = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) y[2*i].qs)),
+                                              _mm256_loadu_si256((const __m256i *) y[2*i + 1].qs), 1);
+        const __m512i yv = _mm512_shuffle_epi8(yr, yidx);
+        // sum((q - 1) * y) = sum(q * y) - sum(y)
+        const __m512i dot = _mm512_sub_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), xv, yv),
+                                             _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, yv));
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const __m512 d = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(y[2*i].d))),
+                                            _mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(y[2*i + 1].d)), 1);
+        acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dot), d, acc);
+    }
+    *s = _mm512_reduce_add_ps(acc);
+#elif defined(__AVX2__)
+    const int qk = QK2_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    // a Q2_0 block (64 weights) pairs with two Q8_0 blocks; in each half, byte b holds weights 4b..4b+3 at bits 0/2/4/6.
+    // Per 128-bit lane, bytes b..b+3 are repeated in all four dwords, dword d is shifted right by 2d and masked: lane byte
+    // 4d+p then holds weight 4p+d; the Q8_0 values are shuffled into the same order.
+    __m256i xidx0  = _mm256_setr_epi8(0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3, 4,5,6,7,4,5,6,7,4,5,6,7,4,5,6,7);
+    __m256i xidx1  = _mm256_add_epi8(xidx0, _mm256_set1_epi8(8));
+    // the index vectors are opaque to the optimizer: with the constants visible clang turns these byte shuffles into vpshufd + vpermq (cross-lane, slow on Zen 2:
+    // the Q2_0 dot ran 25% below gcc's, which keeps vpshufb)
+#if defined(__GNUC__)   // GCC and clang (MSVC has no GNU inline assembly; it keeps its own instruction selection)
+    __asm__("" : "+x"(xidx0), "+x"(xidx1));
+#endif
+    const __m256i shifts = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+    const __m256i yidx   = _mm256_setr_epi8(0,4,8,12,1,5,9,13,2,6,10,14,3,7,11,15, 0,4,8,12,1,5,9,13,2,6,10,14,3,7,11,15);
+    const __m256i m3     = _mm256_set1_epi8(3);
+    const __m256i one    = _mm256_set1_epi8(1);
+
+    // the two Q8_0 halves are written out (no k loop with a run-time index choice): clang kept the loop rolled and was 25% slower than gcc, which unrolls it;
+    // the order of the operations is unchanged, so the result is bit for bit the same
+    __m256 acc = _mm256_setzero_ps();
+#if !defined(__AVXVNNI__)
+    // weights {0..3} are unsigned: sum((q - 1) * y) = sum(q * y) - sum(y), two vpmaddubsw and one subtraction instead of a sign flip of both operands
+    // and a separate - 1 on the weights (integer arithmetic, so the result is exactly the same)
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    for (int i = 0; i < nb; ++i) {
+        const __m256i qq = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) x[i].qs));
+        const float   d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+
+        const __m256i q0 = _mm256_and_si256(_mm256_srlv_epi32(_mm256_shuffle_epi8(qq, xidx0), shifts), m3); // {0..3}
+        const __m256i q1 = _mm256_and_si256(_mm256_srlv_epi32(_mm256_shuffle_epi8(qq, xidx1), shifts), m3);
+        const __m256i y0 = _mm256_shuffle_epi8(_mm256_loadu_si256((const __m256i *) y[2*i + 0].qs), yidx);
+        const __m256i y1 = _mm256_shuffle_epi8(_mm256_loadu_si256((const __m256i *) y[2*i + 1].qs), yidx);
+        const __m256i p0 = _mm256_sub_epi16(_mm256_maddubs_epi16(q0, y0), _mm256_maddubs_epi16(one, y0));
+        const __m256i p1 = _mm256_sub_epi16(_mm256_maddubs_epi16(q1, y1), _mm256_maddubs_epi16(one, y1));
+        const __m256  d_0 = _mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(y[2*i + 0].d));
+        const __m256  d_1 = _mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(y[2*i + 1].d));
+
+        acc = _mm256_fmadd_ps(d_0, _mm256_cvtepi32_ps(_mm256_madd_epi16(p0, ones16)), acc);
+        acc = _mm256_fmadd_ps(d_1, _mm256_cvtepi32_ps(_mm256_madd_epi16(p1, ones16)), acc);
+    }
+#else
+    for (int i = 0; i < nb; ++i) {
+        const __m256i qq = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) x[i].qs));
+        const float   d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+
+        const __m256i xv0 = _mm256_sub_epi8(_mm256_and_si256(_mm256_srlv_epi32(_mm256_shuffle_epi8(qq, xidx0), shifts), m3), one); // {0..3} -> {-1..2}
+        const __m256i xv1 = _mm256_sub_epi8(_mm256_and_si256(_mm256_srlv_epi32(_mm256_shuffle_epi8(qq, xidx1), shifts), m3), one);
+        const __m256i yv0 = _mm256_shuffle_epi8(_mm256_loadu_si256((const __m256i *) y[2*i + 0].qs), yidx);
+        const __m256i yv1 = _mm256_shuffle_epi8(_mm256_loadu_si256((const __m256i *) y[2*i + 1].qs), yidx);
+        const __m256  d_0 = _mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(y[2*i + 0].d));
+        const __m256  d_1 = _mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(y[2*i + 1].d));
+
+        acc = _mm256_fmadd_ps(d_0, mul_sum_i8_pairs_float(xv0, yv0), acc);
+        acc = _mm256_fmadd_ps(d_1, mul_sum_i8_pairs_float(xv1, yv1), acc);
+    }
+#endif
+    *s = hsum_float_8(acc);
+#else
+    ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;

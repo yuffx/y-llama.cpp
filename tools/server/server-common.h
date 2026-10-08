@@ -270,6 +270,12 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
 // if validate_utf8(text) == text.size(), then the whole text is valid utf8
 size_t validate_utf8(const std::string& text);
 
+// load a media file from an URL (http, file, data) or from raw base64 data
+void handle_media(
+        std::vector<raw_buffer> & out_files,
+        const std::string & url,
+        const std::string & media_path);
+
 // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
 // if is_placeholder is true, the media chunk will be treated as placeholder for counting tokens; the output tokens are not usable for actual inference (e.g. for submitting a task to server_queue)
 server_tokens process_mtmd_prompt(
@@ -293,6 +299,15 @@ server_tokens process_mtmd_prompt(
  * - "prompt": [[12, 34, "string", 56, 78], [12, 34, 56], { "prompt_string": "string", "multimodal_data": [ "base64" ]}]
  */
 std::vector<server_tokens> tokenize_input_prompts(
+                                        const llama_vocab * vocab,
+                                        mtmd_context * mctx,
+                                        const json & json_prompt,
+                                        bool add_special,
+                                        bool parse_special,
+                                        const mtmd_helper_init_opt & init_opt);
+
+// tokenize a single prompt, see tokenize_input_prompts() for the supported shapes
+server_tokens tokenize_input_subprompt(
                                         const llama_vocab * vocab,
                                         mtmd_context * mctx,
                                         const json & json_prompt,
@@ -330,6 +345,16 @@ json oaicompat_chat_params_parse(
     const server_chat_params & opt,
     std::vector<raw_buffer> & out_files);
 
+// used by /embeddings endpoint, content has the same format as a chat message content array
+server_tokens tokenize_oai_content_array(
+    const llama_vocab * vocab,
+    mtmd_context * mctx,
+    const server_chat_params & opt,
+    json content,
+    bool add_special,
+    bool parse_special,
+    const mtmd_helper_init_opt & init_opt);
+
 // TODO: move it to server-task.cpp
 json format_embeddings_response_oaicompat(
     const json & request,
@@ -361,6 +386,33 @@ struct server_slot_stats {
     uint64_t n_draft_tokens      = 0;
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
+
+    // engine state for the report: cache hit counters at the start of this request, and the tuning/state JSON of the report
+    uint64_t moe_hits0 = 0, moe_miss0 = 0, moe_up0 = 0, moe_ev0 = 0, moe_bytes0 = 0;
+    uint64_t moe_pr0[16] = {};
+    json     tuning;
+
+    // snapshot at request start
+    void tuning_begin(const llama_tuning_info & t) { for (int i = 0; i < 16; ++i) { moe_pr0[i] = t.moe_pr[i]; } moe_hits0 = t.moe_hits; moe_miss0 = t.moe_misses; moe_up0 = t.moe_uploads; moe_ev0 = t.moe_evictions; moe_bytes0 = t.moe_up_bytes; }
+    // at report time: MoE cache on/off and hit rate of this request and overall, the live tuned knobs, threads and batch sizes
+    void tuning_end(const llama_tuning_info & t) {
+        json m = { {"active", t.moe_active} };
+        if (t.moe_active) {
+            const uint64_t dh = t.moe_hits - moe_hits0, dm = t.moe_misses - moe_miss0, h = t.moe_hits, n = t.moe_hits + t.moe_misses;
+            m["hit_rate_request"] = dh + dm ? 100.0 * dh / (dh + dm) : 0.0;
+            m["hit_rate_total"]   = n ? 100.0 * h / n : 0.0;
+            m["layers"] = t.moe_layers; m["slots_min"] = t.moe_slots_min; m["slots_max"] = t.moe_slots_max; m["uploads"] = t.moe_uploads;
+            m["uploads_request"] = t.moe_uploads - moe_up0; m["evictions_request"] = t.moe_evictions - moe_ev0;
+            m["upload_mib_request"] = (double) (t.moe_up_bytes - moe_bytes0) / 1048576.0;
+            // pressure of this request: demand = met (hits) + unmet (misses); of the misses that reached the swap decision, who was admitted and who declined
+            static const char * names[] = { "", "", "", "pending", "admit_free", "admit_evict", "d_admit", "d_margin", "d_budget", "d_victim", "d_big", "d_dup", "regret", "ev_unpaid", "ev_zero" };
+            json pr = { {"met", dh}, {"unmet", dm} };
+            for (int i = 3; i <= 14; ++i) { pr[names[i]] = t.moe_pr[i] - moe_pr0[i]; }
+            m["pressure"] = pr;
+            m["tuned"] = { {"margin", t.margin}, {"gate", t.gate}, {"wait", t.wait}, {"big", t.big}, {"predict", t.predict}, {"self_tune", t.self_tune} };
+        }
+        tuning = { {"moe_cache", m}, {"n_threads", t.n_threads}, {"n_threads_batch", t.n_threads_batch}, {"n_batch", t.n_batch}, {"n_ubatch", t.n_ubatch} };
+    }
 
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
@@ -614,6 +666,16 @@ struct server_pipe {
     }
 };
 
+// a child server writes its state commands to stdout and its logs to stderr
+enum server_subproc_stream {
+    SERVER_SUBPROC_STDOUT,
+    SERVER_SUBPROC_STDERR,
+    SERVER_SUBPROC_STREAMS,
+};
+
+// gives the current stdout to the caller as a stream of its own, and sends everything else written to stdout to stderr
+FILE * server_reserve_stdout();
+
 // wrapper around common_subproc to manage a child server process
 // mainly used by router mode
 struct server_subproc {
@@ -624,12 +686,15 @@ struct server_subproc {
     void terminate() { sproc.terminate(); }
     int  join() { return sproc.join(); }
 
-    // true if the child's combined stdout/stderr pipe is available (call after create())
+    // true if both output pipes of the child are available (call after create())
     bool has_output();
 
-    // non-blocking read
+    // true once both output pipes are closed
+    bool output_closed() const;
+
+    // non-blocking read from one output pipe
     // returns the number of bytes read, 0 when nothing is available, -1 when the pipe is closed or broken
-    int read_output(char * buf, size_t len);
+    int read_output(server_subproc_stream stream, char * buf, size_t len);
 
     // wait until one of a set of children has output, wake() is called, or a timeout passes
     struct waiter {
@@ -639,13 +704,16 @@ struct server_subproc {
         // thread-safe; on Windows this is a no-op, wait() returns within 50 ms anyway
         void wake();
 
-        // timeout_ms < 0 waits until data or wake(); ready[i] is set for each child with data (or a broken pipe)
+        // timeout_ms < 0 waits until data or wake(); ready[i] is set for each child with data on an open pipe (or a broken pipe)
         void wait(const std::vector<server_subproc *> & procs, std::vector<bool> & ready, int64_t timeout_ms);
 
     private:
+#ifndef _WIN32
         intptr_t wake_fd[2] = { -1, -1 }; // POSIX self-pipe
+#endif
     };
 
 private:
-    intptr_t out_handle = -1; // fd on POSIX, HANDLE on Windows; taken lazily from sproc
+    intptr_t out_handles[SERVER_SUBPROC_STREAMS] = { -1, -1 }; // fd on POSIX, HANDLE on Windows; taken lazily from sproc
+    bool     out_closed [SERVER_SUBPROC_STREAMS] = { false, false };
 };

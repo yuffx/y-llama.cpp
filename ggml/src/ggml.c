@@ -89,6 +89,7 @@ uint64_t ggml_graph_next_uid(void) {
 #include <sys/wait.h>
 #if defined(__linux__)
 #include <sys/prctl.h>
+#include <sys/mman.h>
 #endif
 
 #if defined(__ANDROID__)
@@ -250,6 +251,36 @@ GGML_API ggml_abort_callback_t ggml_set_abort_callback(ggml_abort_callback_t cal
     return ret_val;
 }
 
+static ggml_moe_obs_cb_t g_moe_obs_cb = NULL;
+static void *             g_moe_obs_ud = NULL;
+
+void ggml_set_moe_obs_callback(ggml_moe_obs_cb_t cb, void * ud) {
+    g_moe_obs_cb = cb;
+    g_moe_obs_ud = ud;
+}
+
+ggml_moe_obs_cb_t ggml_get_moe_obs_callback(void ** ud) {
+    if (ud) {
+        *ud = g_moe_obs_ud;
+    }
+    return g_moe_obs_cb;
+}
+
+static ggml_moe_phase_cb_t g_moe_phase_cb = NULL;
+static void *              g_moe_phase_ud = NULL;
+
+void ggml_set_moe_phase_callback(ggml_moe_phase_cb_t cb, void * ud) {
+    g_moe_phase_cb = cb;
+    g_moe_phase_ud = ud;
+}
+
+ggml_moe_phase_cb_t ggml_get_moe_phase_callback(void ** ud) {
+    if (ud) {
+        *ud = g_moe_phase_ud;
+    }
+    return g_moe_phase_cb;
+}
+
 void ggml_abort(const char * file, int line, const char * fmt, ...) {
     fflush(stdout);
 
@@ -365,7 +396,20 @@ void * ggml_aligned_malloc(size_t size) {
             break;
     }
   #else
-    int result = posix_memalign(&aligned_memory, alignment, size);
+  #if defined(__linux__)
+    // big buffers (model weights loaded without mmap, KV cache) 2 MB aligned and marked for transparent huge pages
+    // (THP mode "madvise"): streaming GBs per token through 4 KB pages costs TLB misses. Measured on a CPU-only Qwen3.6-35B
+    // decode (Ryzen 3600): 9.50 -> 9.73 t/s.
+    const size_t align_hp = size >= (2u << 20) && alignment < (2u << 20) ? (2u << 20) : alignment;
+  #else
+    const size_t align_hp = alignment;
+  #endif
+    int result = posix_memalign(&aligned_memory, align_hp, size);
+  #if defined(__linux__)
+    if (result == 0 && size >= (2u << 20)) {
+        madvise(aligned_memory, size, MADV_HUGEPAGE);
+    }
+  #endif
   #endif
     if (result != 0) {
         // Handle allocation failure
@@ -1778,6 +1822,15 @@ static struct ggml_tensor * ggml_new_tensor_impl(
     if (view_src != NULL && view_src->view_src != NULL) {
         view_offs += view_src->view_offs;
         view_src   = view_src->view_src;
+    }
+
+    // validate number of elements to fit in int64_t
+    int64_t current_nelements = ne[0];
+    for (int i = 1; i < n_dims; i++) {
+        if (ne[i] > 1) {
+            GGML_ASSERT(INT64_MAX / ne[i] > current_nelements);
+            current_nelements *= ne[i];
+        }
     }
 
     size_t data_size = ggml_row_size(type, ne[0]);
@@ -3897,8 +3950,8 @@ struct ggml_tensor * ggml_permute(
     struct ggml_tensor * result = ggml_view_tensor(ctx, a);
     ggml_format_name(result, "%s (permuted)", a->name);
 
-    int ne[GGML_MAX_DIMS];
-    int nb[GGML_MAX_DIMS];
+    int64_t ne[GGML_MAX_DIMS];
+    size_t nb[GGML_MAX_DIMS];
 
     ne[axis0] = a->ne[0];
     ne[axis1] = a->ne[1];
@@ -7450,7 +7503,7 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
 
 static size_t ggml_graph_nbytes(size_t size, bool grads) {
     size_t hash_size = ggml_hash_size(size * 2);
-    void * p = 0;
+    void * p = (char *) 1024; // workaround for ubsan error "applying non-zero offset X to null pointer"
     incr_ptr_aligned(&p, sizeof(struct ggml_cgraph), 1);
     incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // nodes
     incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // leafs
@@ -7463,7 +7516,7 @@ static size_t ggml_graph_nbytes(size_t size, bool grads) {
     incr_ptr_aligned(&p, ggml_bitset_size(hash_size) * sizeof(ggml_bitset_t), sizeof(ggml_bitset_t));
 
     size_t nbytes = (size_t) p;
-    return nbytes;
+    return nbytes - 1024;
 }
 
 size_t ggml_graph_overhead_custom(size_t size, bool grads) {
@@ -7992,6 +8045,7 @@ void ggml_graph_dump_dot(const struct ggml_cgraph * gb, const struct ggml_cgraph
 ////////////////////////////////////////////////////////////////////////////////
 
 void ggml_set_input(struct ggml_tensor * tensor) {
+    GGML_ASSERT(tensor->op == GGML_OP_NONE);
     tensor->flags |= GGML_TENSOR_FLAG_INPUT;
 }
 

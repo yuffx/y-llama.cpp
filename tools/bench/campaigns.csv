@@ -1,0 +1,91 @@
+name,start,note,conclusion,why
+stockcmp-b11509,2026-09-30 15:50:52,"stock b11041 vs fork b11509 vs fork MARGIN=0, bare defaults, short (chat) and long (pf12k), bigger-than-VRAM models, PC1; script /p/bw/data/hcf/stockcmp.sh","PAUSED 2026-09-30 17:20 after MiMo (short+long fork), GLM short; to be redone after tuner changes (margin tuning, -tb, gate) and on the release candidate build","user: results would need redoing with the tuning changes anyway; tune first, retest and release later"
+autogate-d43c101,2026-09-30 17:17:39,"rc-next2 d43c101 live margin/gate tuner vs forced variants, GLM and MiMo, short+long, PC1","STOPPED early (13/24 runs). GLM: GATE=3 +6% on short chat (22.10 vs 20.87, n2), ties best on long; margin 0 wins short, timing rule wins long; the old 36-token-slice tuner picks MARGIN=-2 every time (slice mixing). MiMo: tuner 8.96 t/s (n1) only",enough signal on GLM; MiMo reduced to a gate on/off check on the tune-next build
+tunenext-160f65c8e,2026-09-30 19:06:17,"tune-next 160f65c8e: long-slice margin tuner vs the forced variants of autogate-d43c101, GLM short + long, PC1",,
+stockglm-upstream,2026-09-30 19:47:46,"upstream master 05af0d2b1 loads GLM-5.3-Flash: real stock leg for GLM, short + long, bare, PC1",,
+autotune-basic,2026-09-30 20:47:03,"release autotune vs upstream stock 05af0d2b1, PC1, Qwen3.6-35B-A3B GSQ-hybrid, perf.py t100: tetris prompt, 100 tokens, -c 1024, temp 0, bare",,
+autotune-models,2026-09-30 20:51:40,"release autotune b11648 vs upstream stock 05af0d2b1, PC1, t100 tetris -n100 -c1024 temp0 bare: Qwen3.8-Next IQ1_M/IQ3_S, GLM 3.5bit, Qwen3.8-27B IQ4_NL",,
+autotune-models2,2026-09-30 21:09:18,"release autotune b11648 vs upstream stock 05af0d2b1, PC1, t100 tetris -n100 -c1024 temp0 bare: Qwen3.8-Next IQ1_M/IQ3_S, GLM 3.5bit, Qwen3.8-27B IQ4_NL",,
+history-rewrite-2026-10-01,2026-10-01 08:00:00,commit_sha values before this date refer to pre-rewrite SHAs; old->new map in ~/sessions/claude-handover-2026-10-01/commit-map.txt,,
+autotune-switch,2026-10-01 10:22:09,"release b11665+ candidate: -at off and --moe cache=0 vs default vs stock, t100 tetris",,
+autotune-vs-stock-big,2026-10-01 10:44:21,"b11703 ebb1774ee candidate, models bigger than VRAM: default autotune (4 runs, hot = last 2) vs --moe cache=0 vs -at off vs stock, t100",,
+runpy-smoke,2026-10-01 10:50:09,"bench /m/q/36/Qwen3.6-35B-A3B-GSQ-hybrid.gguf builds autotune,stock-def4d406a variants default,cache0 test t100 n=2",,
+runpy-pc2,2026-10-01 10:52:51,"bench /home/o/qwen36.gguf builds autotune,stock variants default,cache0 test t100 n=1",,
+runpy-w10,2026-10-01 10:54:31,"bench N:\m\qwen36.gguf builds ls,tmp\chk variants default,cache0 test t100 n=1",,
+big-models-b11703,2026-10-01 10:59:54,b11703 ebb1774ee vs stock def4d406a,,
+big-models-cold-b11703,2026-10-01 11:00:59,"first runs, no discarded run; b11703 ebb1774ee vs stock def4d406a",,
+big-models-cold-b11703,2026-10-01 11:07:50,"resumed after the csv switch; first runs, no discarded run",,
+release-b11707-w10,2026-10-01 11:24:03,"bench N:\m\qwen36.gguf builds tmp\chk,ls variants default,atoff,cache0 test t100 n=1",,
+ubatch-profile,2026-10-01 13:36:15,"bench /m/q/1/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf,/m/q/36/Qwen3.6-35B-A3B-GSQ-hybrid.gguf builds b11707-49fe4b756 variants default test t100 n=3",,
+ubatch-profile,2026-10-01 13:39:02,"bench /m/q/1/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf,/m/q/36/Qwen3.6-35B-A3B-GSQ-hybrid.gguf builds autotune variants default test t100 n=3",,
+ubatch-model,2026-10-01 13:46:36,"bench /m/q/1/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf,/m/q/36/Qwen3.6-35B-A3B-GSQ-hybrid.gguf builds b11707-49fe4b756 variants default test t100 n=3",,
+ubatch-model,2026-10-01 13:49:45,"bench /m/q/1/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf,/m/q/36/Qwen3.6-35B-A3B-GSQ-hybrid.gguf builds autotune variants default test t100 n=3",,
+readme-redo-pl350-370,2026-10-02 10:19:14,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit-q4kattn.gguf builds autotune,stock-lc variants default test chat n=2","cancelled, GLM 3.0 chat only: release 23.2-23.9 t/s at 350+370 W vs 22.3-22.6 at 280 W (different build and session, not paired)",power cap does not bind for decode (cards draw 100-210 W); PC1 stays at 280 W
+readme-redo-pl350-370,2026-10-02 10:21:33,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit-q4kattn.gguf builds autotune,dev,stock-lc variants default test chat n=2","cancelled, GLM 3.0 chat only: release 23.2-23.9 t/s at 350+370 W vs 22.3-22.6 at 280 W (different build and session, not paired)",power cap does not bind for decode (cards draw 100-210 W); PC1 stays at 280 W
+readme-redo-pl350-370-nowarm,2026-10-02 10:37:15,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit-q4kattn.gguf builds autotune,dev,stock-lc variants default test chat n=2","invalid: no warm-up run, the first build read the model cold",campaign cancelled
+readme-redo-pl350-370-nowarm,2026-10-02 10:37:45,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit-q4kattn.gguf builds autotune,dev,stock-lc variants default test chat n=1","invalid: no warm-up run, the first build read the model cold",campaign cancelled
+readme-redo-pl350-370-nowarm,2026-10-02 10:43:41,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.5bit.gguf builds autotune,dev,stock-lc variants default test t100 n=1","invalid: no warm-up run, the first build read the model cold",campaign cancelled
+readme-redo-pl350-370-nowarm,2026-10-02 10:51:59,"bench /m/m/3/MiMo-V2.6-Flash-RL-IQ3_XXS-00001-of-00008.gguf builds autotune,dev,stock-lc variants default test chat n=1","invalid: no warm-up run, the first build read the model cold",campaign cancelled
+readme-redo-pl350-370,2026-10-02 10:54:11,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit-q4kattn.gguf builds autotune,dev,stock-lc variants default test chat n=1","cancelled, GLM 3.0 chat only: release 23.2-23.9 t/s at 350+370 W vs 22.3-22.6 at 280 W (different build and session, not paired)",power cap does not bind for decode (cards draw 100-210 W); PC1 stays at 280 W
+lru-ab-emu2x16,2026-10-02 11:50:14,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit-q4kattn.gguf builds dev,stock-lc variants default,lru,m0 test fix n=3","stopped, first cell only",replaced by the real 2 x 24 GB runs
+lru-ab-real,2026-10-02 12:24:56,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit-q4kattn.gguf builds dev,stock-lc variants default,lru,m0 test fix n=3","cancelled, no result",bench started twice by mistake; replaced by lru-ab-ppl1
+lru-ab-stage1,2026-10-02 12:29:16,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit-q4kattn.gguf builds dev,stock-lc variants default,lru,lruk,slru,lfua,m0,adm2 test fix n=3","invalid: output text differs per cell, hit rate and t/s depend on the text",replaced by the ppl comparator (lru-ab-ppl1)
+lru-ab-stage1,2026-10-02 12:29:56,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit-q4kattn.gguf builds dev,stock-lc variants default,lru,lruk,slru,lfua,m0,adm2 test fix n=3","invalid: output text differs per cell, hit rate and t/s depend on the text",replaced by the ppl comparator (lru-ab-ppl1)
+lru-ab-ppl1,2026-10-02 12:55:50,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit-q4kattn.gguf builds dev,stock-lc variants default,lru,lruk,slru,lfua,m0,adm2 test ppl n=3","our eviction is level with plain LRU (18.61 vs 18.71 t/s); admit 2 +16%, margin 0 +11.5%, aging LFU +11%, LRU-2 +9% over ours on GLM 3.0 (ranges apart); SLRU no better","ppl comparator = identical routing input, 3 runs ABBA; the recency policies ran with big=0. One model: stage 2 (GLM 3.5, MiMo) decides the default"
+pred-ab-ppl,2026-10-02 13:58:32,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit-q4kattn.gguf builds dev,stock-lc variants default,sm2,sm3,sm4,nopred test ppl n=3",invalid: the predictor was never enabled in these cells,--moe predict=M or train=N is needed; stream_m and predict=0 variants all ran with it off
+pred-ab-ppl2,2026-10-02 14:26:58,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit-q4kattn.gguf builds dev,stock-lc variants default,early8,learn12,learn4,learn2 test ppl n=3","predictor loses on PC1 GLM 3.0 once the cache is warm: early router -3%, learned -10% (18.3-18.5 vs 20.4 t/s); fewer candidates (4, 2) do not help","hit +0.4/+0.7 points only, uploads/evictions/PCIe ~2x, DDR 17-19 GB/s (not saturated); the learned predictor's loss is its own compute and upload copies, not DDR starvation"
+pc3-pred-ppl,2026-10-02 14:50:23,"bench N:\m\qwen36.gguf builds pred variants default,cache0,early8,learn12,learn4,learn2 test ppl n=3",invalid: overlapped with another bench on the laptop,rerun as one clean run
+pc3-pred-next,2026-10-02 15:08:44,"bench N:\m\Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf builds pred variants default,cache0,early8,early8ra,learn12,learn4 test ppl n=3","invalid: killed, overlapped with another bench on the laptop",rerun as one clean run
+lru-ab-ppl2,2026-10-02 15:14:56,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.5bit.gguf builds dev,stock-lc variants default,adm2,m0,lfua,lruk,adm2m0 test ppl n=3",,
+lead-ab-pin,2026-10-02 15:41:23,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit-q4kattn.gguf builds dev variants off,old2,lead,lead_s4,early test ppl n=3",,
+regress-quick,2026-10-03 09:26:49,"smoke test for big regressions: README protocol t100, one measured run per cell, final build fd4c3d2d3",,
+regress-quick,2026-10-03 09:27:14,"smoke test for big regressions: README protocol t100, final build fd4c3d2d3 only, one run per model, compare with the README table",,
+regress-quick-start2,2026-10-03 09:36:39,start 2 (same default state file): the cache trial,,
+regress-quick-start2,2026-10-03 09:37:18,start 2 (same default state file): the cache trial,,
+regress-quick-start3,2026-10-03 09:40:10,"IQ4_XS start 3, same default state file",,
+regress-quick-start4,2026-10-03 09:40:45,"IQ4_XS start 4, same default state file",,
+mimo-hostbuild,2026-10-03 09:44:58,MiMo: stock native build against stock built with our docker recipe,,
+mimo-hostbuild,2026-10-03 09:45:45,"MiMo: rc-final, 3 starts of one default state (the third is settled)",,
+mimo-ub,2026-10-03 10:03:44,MiMo rc-final with -ub 512 forced (same state file as the 2048 starts),,
+mimo-chat,2026-10-03 10:34:19,"MiMo rc-final, the README test: chat completion, 1500 tokens",,
+observer,2026-10-03 12:56:54,"bench /m/q/4/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf builds rc-obs-499914d7f variants obs_on,obs_off test t100 n=1",,
+observer,2026-10-03 12:58:20,bench /m/q/4/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf builds rc-obs-499914d7f variants obs_on test t100 n=2,,
+readme-glm-picks,2026-10-03 15:31:50,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf builds stock-def4d406a,b11707-49fe4b756,rc-picks-f427df4ce variants default test t100 n=2",,
+readme-glm-picks,2026-10-03 15:45:52,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf builds stock-def4d406a,b11707-49fe4b756,rc-picks-f427df4ce variants default test chat n=2",,
+glm-bisect,2026-10-03 16:13:23,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf builds b11707-49fe4b756,rn-before-measure,rc-merge-43c979eb9,rc-final-fd4c3d2d3,rc-picks-f427df4ce variants default test t100 n=2",,
+final-w10,2026-10-03 23:05:33,"bench N:\m\qwen36.gguf builds stock-b11379,b11707-49fe4b756,final-win variants default test t100 n=3",,
+final-w10,2026-10-04 00:04:37,"bench N:\m\qwen36.gguf builds stock-b11379,b11707-49fe4b756,final-win variants default test t100 n=3",,
+final-w10,2026-10-04 00:06:52,"bench N:\m\Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf builds stock-b11379,b11707-49fe4b756,final-win variants default test t100 n=3",,
+final-w10b,2026-10-04 00:19:55,"bench N:\m\qwen36.gguf builds stock-b11379,b11707-49fe4b756,final-win variants default test t100 n=3",,
+final-w10b,2026-10-04 00:22:25,"bench N:\m\Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf builds stock-b11379,b11707-49fe4b756,final-win variants default test t100 n=3",,
+readme-rerun,2026-10-04 00:46:04,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf builds stock-docker-836d57176,b11707-49fe4b756,release-3db71c4ee variants default test chat n=3",,
+readme-rerun,2026-10-04 01:04:59,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf builds stock-docker-836d57176,b11707-49fe4b756,release-3db71c4ee variants default test t100 n=3",,
+final-w10c,2026-10-04 01:12:48,"bench N:\m\Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf builds stock-b11379,b11707-49fe4b756,final-win variants default test t100 n=3",,
+readme-rerun,2026-10-04 01:30:58,"bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf builds stock-docker-836d57176,b11707-49fe4b756,release-3db71c4ee variants default test chat n=3",,
+readme-rerun,2026-10-04 01:37:31,bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf builds release-3db71c4ee variants default test chat n=3,,
+readme-rerun,2026-10-04 01:58:39,bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf builds release-ac2e8344b variants default test chat n=3,,
+readme-rerun,2026-10-04 02:04:24,bench /m/q/1/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf builds release-ac2e8344b variants default test t100 n=3,,
+pub-w10,2026-10-04 02:04:55,"bench N:\m\qwen36.gguf builds stock-b11379,b11707-49fe4b756,pub-b12030 variants default test t100 n=3",,
+readme-rerun,2026-10-04 02:05:24,bench /m/q/1/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf builds release-ac2e8344b variants default test t100 n=3,,
+readme-rerun,2026-10-04 02:07:40,"bench /m/q/4/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf builds stock-docker-836d57176,b11707-49fe4b756,release-ac2e8344b variants default test chat n=3",,
+pub-w10,2026-10-04 02:26:34,"bench N:\m\Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf builds stock-b11379,b11707-49fe4b756,pub-b12030 variants default test t100 n=3",,
+readme-rerun,2026-10-04 02:32:25,"bench /m/q/4/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf builds stock-docker-836d57176,b11707-49fe4b756,release-ac2e8344b variants default test pf12k n=3",,
+readme-rerun,2026-10-04 02:50:21,"bench /m/m/3/MiMo-V2.6-Flash-RL-IQ3_XXS-00001-of-00008.gguf builds stock-docker-836d57176,b11707-49fe4b756,release-ac2e8344b variants default test chat n=3",,
+readme-rerun,2026-10-04 03:12:00,"bench /m/m/3/MiMo-V2.6-Flash-RL-IQ3_XXS-00001-of-00008.gguf builds stock-docker-836d57176,b11707-49fe4b756,release-ac2e8344b variants default test pf12k n=3",,
+readme-rerun,2026-10-04 03:44:56,bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.5bit.gguf builds release-ac2e8344b variants default test t100 n=3,,
+readme-rerun,2026-10-04 03:50:06,bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf builds release-ac2e8344b variants default test chat n=3,,
+readme-rerun,2026-10-04 04:02:59,bench /m/gl/3/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf builds release-ac2e8344b variants default test t100 n=3,,
+readme-rerun,2026-10-04 04:17:16,"bench /m/q/4/Qwen3.8-27B-IQ4_NL.gguf builds stock-docker-836d57176,b11707-49fe4b756,release-ac2e8344b variants default test t100 n=3",,
+pub-w10,2026-10-04 04:21:19,"bench N:\m\Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf builds stock-b11379,b11707-49fe4b756,pub-b12030 variants default test t100 n=3",,
+readme-rerun,2026-10-04 09:56:25,"bench /m/q/4/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf builds stock-docker-836d57176,b11707-49fe4b756,release-ac2e8344b variants default test pf12k n=3",,
+readme-rerun,2026-10-04 10:10:26,bench /m/q/1/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf builds release-b12040 variants default test t100 n=4,,
+readme-rerun,2026-10-04 10:11:24,bench /m/q/1/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf builds release-b12040 variants default test t100 n=4,,
+readme-rerun,2026-10-04 10:13:43,"bench /m/q/4/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf builds stock-docker-836d57176,b11707-49fe4b756,release-b12040 variants default test chat n=4",,
+iq3s-fix,2026-10-04 10:21:07,bench /m/q/1/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf builds release-b12048 variants default test t100 n=4,,
+edit4,2026-10-04 10:24:44,"bench /m/q/1/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf builds stock-docker-836d57176,b11707-49fe4b756,release-b12048 variants default test edit4 n=4",,
+readme-rerun,2026-10-04 10:26:06,bench /m/q/1/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf builds release-b12048 variants default test t100 n=4,,
+readme-rerun,2026-10-04 10:27:33,bench /m/q/1/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf builds release-b12048 variants default test t100 n=4,,
+readme-rerun,2026-10-04 10:31:10,"bench /m/q/4/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf builds stock-docker-836d57176,b11707-49fe4b756,release-b12048 variants default test chat n=4",,
+readme-rerun,2026-10-04 10:38:06,bench /m/q/1/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf builds release-b12048 variants default test t100 n=4,,
+readme-rerun,2026-10-04 10:39:42,bench /m/q/1/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf builds release-b12048 variants default test t100 n=4,,
+readme-rerun,2026-10-04 10:43:03,"bench /m/q/4/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf builds stock-docker-836d57176,b11707-49fe4b756,release-b12048 variants default test chat n=4",,

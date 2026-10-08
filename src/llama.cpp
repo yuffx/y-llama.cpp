@@ -14,6 +14,7 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "ggml-backend.h"
+#include "ggml-alloc.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -25,6 +26,7 @@
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -72,7 +74,7 @@ enum llama_load_mode llama_load_mode_from_str(const char * str) {
     if (std::strcmp(str, "mlock")      == 0) { return LLAMA_LOAD_MODE_MLOCK;      }
     if (std::strcmp(str, "mmap+mlock") == 0) { return LLAMA_LOAD_MODE_MMAP_MLOCK; }
     if (std::strcmp(str, "dio")        == 0) { return LLAMA_LOAD_MODE_DIRECT_IO;  }
-    throw std::invalid_argument(std::string("unknown load mode: ") + str);
+    GGML_ABORT("unknown load mode: %s", str);
 }
 
 struct llama_sampler_chain_params llama_sampler_chain_default_params() {
@@ -340,10 +342,50 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
         }
 
+        // big-batch ops on host weights (e.g. MoE experts with --cpu-moe) are offloaded
+        // to one GPU, so its upload bandwidth bounds prompt processing. GPUs are numbered
+        // by bus order, not slot speed: measure host->GPU upload and offload to the
+        // fastest (x4/x16, PCIe gen and chipset sharing all count, on any OS and
+        // backend). Layers keep bus order: moving them measured ~7% slower decode.
+        size_t gpu_offload = 0;
+        if (gpus.size() > 1) {
+            constexpr size_t n_bytes = 64u << 20;
+            std::vector<uint8_t> host(n_bytes, 1);
+            auto h2d_gbs = [&](ggml_backend_dev_t dev) -> double {
+                ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+                ggml_context * ctx = ggml_init(ip);
+                ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, n_bytes);
+                ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(dev));
+                double best = 0.0;
+                if (buf) {
+                    for (int i = 0; i < 3; ++i) { // first copy warms up
+                        const int64_t t0 = ggml_time_us();
+                        ggml_backend_tensor_set(t, host.data(), 0, n_bytes);
+                        const double gbs = n_bytes / 1e3 / std::max<int64_t>(1, ggml_time_us() - t0);
+                        best = i ? std::max(best, gbs) : 0.0;
+                    }
+                    ggml_backend_buffer_free(buf);
+                }
+                ggml_free(ctx);
+                return best;
+            };
+            double best = 0.0;
+            for (size_t i = 0; i < gpus.size(); ++i) {
+                const double gbs = h2d_gbs(gpus[i].dev);
+                LLAMA_LOG_INFO("%s: %s host->device upload %.1f GB/s\n", __func__, ggml_backend_dev_name(gpus[i].dev), gbs);
+                // within 15% counts as equal: identical setups keep the first GPU
+                if (i == 0 || gbs > 1.15*best) {
+                    gpu_offload = i;
+                    best = gbs;
+                }
+            }
+        }
+
         // add RPC servers at the front of the list to minimize network transfers
         model->devices.insert(model->devices.begin(), rpc_servers.begin(), rpc_servers.end());
 
         // add GPUs
+        model->dev_offload = model->devices.size() + gpu_offload;
         model->devices.insert(model->devices.end(), gpus.begin(), gpus.end());
 
         // add integrated GPUs only if no discrete GPUs were found
@@ -363,6 +405,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 return false;
             }
             llama_device main_gpu = model->devices[params.main_gpu];
+            model->dev_offload = 0;
             model->devices.clear();
             model->devices.push_back(main_gpu);
         }
@@ -481,6 +524,7 @@ static struct llama_model * llama_model_load_from_file_impl(
             return nullptr;
         }
     }
+    // TODO: remove
     ggml_time_init();
 
     if (!params.vocab_only && ggml_backend_reg_count() == 0) {

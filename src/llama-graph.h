@@ -13,6 +13,7 @@
 #include <functional>
 #include <map>
 #include <tuple>
+#include <map>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -20,6 +21,7 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_prec_policy;
 
 struct llama_memory_context_i;
 
@@ -135,8 +137,14 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * tokens = nullptr; // I32 [n_batch]
-    ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
+    ggml_tensor * tokens       = nullptr; // I32 [n_batch]
+    ggml_tensor * embd         = nullptr; // F32 [n_embd, n_batch]
+    ggml_tensor * mixed_tokens = nullptr; // I32 [n_tok_rows], mixed path: ids of the token rows
+    ggml_tensor * mixed_slots  = nullptr; // I64 [n_tok_rows], mixed path: batch index of the token rows
+    ggml_tensor * mixed_embd   = nullptr; // F32 [n_embd, n_batch], mixed path: embd rows, token rows are overwritten
+    ggml_tensor * scale_rows   = nullptr; // F32 [1, n_batch], per-row scale: scale_tok for token rows, 1 for embd rows
+
+    float scale_tok = 1.0f;
 
     const int64_t n_embd = 0;
 };
@@ -274,8 +282,8 @@ public:
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
-    ggml_tensor * s_copy_main;   // I32 [n_seqs]
-    ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
+    ggml_tensor * s_copy_main; // I32 [n_seqs]
+    ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
 
     // Ring-mode physical destination rows, ordered j + n_seqs*s.
     // Per-snapshot leaves are first-class inputs because views do not inherit the scheduler's staged-input contract.
@@ -800,6 +808,8 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    const llama_prec_policy * prec_policy = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -840,6 +850,7 @@ struct llm_graph_params {
             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
             ubatch.n_seqs       == other.ubatch.n_seqs &&
             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
+            ubatch.is_mixed()   == other.ubatch.is_mixed() &&
             (
                 (!ubatch.token && !other.ubatch.token) ||
                 (!ubatch.embd  && !other.ubatch.embd)  ||
@@ -921,6 +932,8 @@ public:
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
+    ggml_tensor * get_mtp_dsa_sel() const { return t_mtp_dsa_sel; }
+    ggml_tensor * get_mtp_dsa_mask() const { return t_mtp_dsa_mask; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -956,6 +969,8 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_mtp_dsa_sel  = nullptr;
+    ggml_tensor * t_mtp_dsa_mask = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1002,6 +1017,10 @@ struct llm_graph_qkv {
 };
 
 struct llm_graph_context {
+    // 2-GPU prefill (LLAMA_PREFILL_SPLIT): while set, build_lora_mm_id pins its MUL_MAT_ID to this backend and marks it as
+    // taking negative (skipped) expert ids, whose output rows are zeroed
+    mutable ggml_backend_t mm_id_backend = nullptr;
+
     const llm_arch arch;
 
     const llama_hparams & hparams;
@@ -1042,10 +1061,29 @@ struct llm_graph_context {
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
 
+    // MoE expert cache router predictor: predictions made at an earlier layer, keyed by target layer;
+    // trained (in the graph) once the target layer's router logits exist
+    struct moe_pred_src {
+        ggml_tensor *  w;                 // stacked [n_embd, n_expert * K]
+        ggml_tensor *  q;                 // its Q8_0 prediction copy (nullptr: predict from w)
+        ggml_tensor *  x;                 // the source layer's MoE input [n_embd, n_tokens]
+        ggml_tensor *  pred;              // stacked prediction [n_expert * K, n_tokens]
+        ggml_tensor *  mu;
+        ggml_backend_t backend;
+        int            K;
+        std::vector<ggml_tensor *> real;  // the target layers' router logits, collected in order
+    };
+    mutable std::map<int, moe_pred_src> moe_pred_srcs;                      // source layer ->
+    mutable std::map<int, std::vector<int>> moe_pred_todo;                  // target layer -> source layers
+    // LLAMA_MOE_DEFER: layer L's deferred host experts (weighted sum), added to the next MoE layer's output
+    mutable ggml_tensor * moe_defer_pending = nullptr;
+
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+
+    const llama_prec_policy * prec_policy;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1190,7 +1228,8 @@ struct llm_graph_context {
     // inputs
     //
 
-    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+    // tok_scale: applied to token rows only
+    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
@@ -1369,15 +1408,15 @@ struct llm_graph_context {
     //         `llama_memory_recurrent`
     ggml_tensor * build_rs(
             ggml_tensor * s,
+            ggml_tensor * state_copy,
             ggml_tensor * state_copy_main,
-            ggml_tensor * state_copy_extra,
                 int32_t   state_size,
                 int32_t   n_seqs,
                uint32_t   n_rs,
                uint32_t   rs_head,
                uint32_t   rs_size,
                 int32_t   rs_zero,
-            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+            const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
 
     llm_graph_input_rs * build_rs_inp() const;
 
@@ -1386,7 +1425,7 @@ struct llm_graph_context {
             ggml_tensor * s,
                 int32_t   state_size,
                 int32_t   n_seqs,
-            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+            const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

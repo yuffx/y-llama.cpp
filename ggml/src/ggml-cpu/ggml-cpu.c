@@ -4,7 +4,6 @@
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "traits.h"
-#include "iqp.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "quants.h"
@@ -15,6 +14,7 @@
 #include "ops.h"
 #include "ggml.h"
 #include "common.h"
+#include "tiled/tiled.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -459,7 +459,7 @@ typedef pthread_mutex_t    ggml_mutex_t;
 
 #define ggml_lock_init(x)    UNUSED(x)
 #define ggml_lock_destroy(x) UNUSED(x)
-#if defined(__x86_64__) || (defined(_MSC_VER) && defined(_M_AMD64))
+#if defined(__x86_64__) || (defined(_MSC_VER) && defined(_M_AMD64) && !defined(_M_ARM64EC))
 #define ggml_lock_lock(x)    _mm_pause()
 #else
 #define ggml_lock_lock(x)    UNUSED(x)
@@ -1265,6 +1265,11 @@ void ggml_compute_forward_mul_mat(
         return;
     }
 
+    // If tiled is supported, it will execute the full op here and we return
+    if (ggml_compute_forward_mul_mat_tiled(params, dst)) {
+        return;
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int ith = params->ith;
@@ -1300,7 +1305,7 @@ void ggml_compute_forward_mul_mat(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    if (src1_cont) {
+    if (!params->use_ref && src1_cont) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
@@ -1329,9 +1334,11 @@ UseGgmlGemm1:;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
-        // the F16 path below writes plain floats into wdata, so it needs an F32 vec_dot_type
-        GGML_ASSERT(src1->type == GGML_TYPE_F32 || vec_dot_type == GGML_TYPE_F32);
+        // src1 is either packed from F32 into vec_dot_type, or widened from F16 or BF16 into the F32 work buffer
+        const bool widen = src1->type != GGML_TYPE_F32;
+
+        GGML_ASSERT(!widen || vec_dot_type == GGML_TYPE_F32);
+        GGML_ASSERT(!widen || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
 
     #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1344,20 +1351,24 @@ UseGgmlGemm1:;
             }
         }
     #else
+        const int64_t bs = ggml_blck_size(vec_dot_type);
+
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    size_t bs = ggml_blck_size(vec_dot_type);
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    const char * src1_block = (const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10;
-                    char * dst_block = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0;
-                    const int64_t n_block = (ne10_block_end - ne10_block_start) * bs;
+                    const void * src1_row  = (const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10;
+                    void       * wdata_row =                    wdata  + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0;
 
-                    if (src1->type == GGML_TYPE_F32) {
-                        from_float((const float *) src1_block, dst_block, n_block);
+                    const int64_t ne10_block_size = (ne10_block_end - ne10_block_start) * bs;
+
+                    if (src1->type == GGML_TYPE_F16) {
+                        ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_row, (float *) wdata_row, ne10_block_size);
+                    } else if (src1->type == GGML_TYPE_BF16) {
+                        ggml_cpu_bf16_to_fp32((const ggml_bf16_t *) src1_row, (float *) wdata_row, ne10_block_size);
                     } else {
-                        ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_block, (float *) dst_block, n_block);
+                        from_float((const float *) src1_row, wdata_row, ne10_block_size);
                     }
                 }
             }
@@ -1372,15 +1383,8 @@ UseGgmlGemm1:;
 
     ggml_barrier(params->threadpool);
 
-    // IQ panel gemm (see iqp.h) - must come after the barrier above, it consumes the q8_K rows
-    // of src1 from the work buffer
-    if (ggml_cpu_iqp_supports_mul_mat(dst) && !params->use_ref) {
-        ggml_compute_forward_mul_mat_iqp(params, dst);
-        return;
-    }
-
 #if GGML_USE_LLAMAFILE
-    if (src1->type != vec_dot_type) {
+    if (!params->use_ref && src1->type != vec_dot_type) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1547,7 +1551,31 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
-static void ggml_compute_forward_mul_mat_id(
+// bytes one host-expert MUL_MAT_ID reads from RAM: one src0 matrix per distinct uncached expert
+static size_t ggml_moe_host_bytes(const struct ggml_tensor * dst) {
+    const struct ggml_tensor * ids = dst->src[2];
+    const int32_t * tbl   = (const int32_t *) dst->src[3]->data;
+    const int32_t   dummy = ggml_get_op_params_i32(dst, 0);
+    const int64_t   n_as  = dst->src[0]->ne[2];
+    // an expert counts once however many tokens use it: a seen flag per expert (O(tokens x used), was a rescan of every earlier slot)
+    uint8_t   seen_stack[1024];
+    uint8_t * seen = n_as <= 1024 ? seen_stack : (uint8_t *) malloc((size_t) n_as);
+    if (!seen) { return 0; }
+    memset(seen, 0, (size_t) n_as);
+    size_t bytes = 0;
+    for (int64_t t = 0; t < ids->ne[1]; ++t) {
+        for (int64_t i = 0; i < ids->ne[0]; ++i) {
+            const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
+            if (e < 0 || e >= n_as || seen[e]) { continue; }
+            seen[e] = 1;
+            bytes += tbl[e] == dummy ? dst->src[0]->nb[2] : 0;
+        }
+    }
+    if (seen != seen_stack) { free(seen); }
+    return bytes;
+}
+
+static void ggml_compute_forward_mul_mat_id_impl(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
 
@@ -1596,15 +1624,9 @@ static void ggml_compute_forward_mul_mat_id(
     char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
         incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
 
-    // IQ panel gemm (see iqp.h); per expert eligibility is decided below, but the work buffer is
-    // reserved for the whole node (ggml_graph_plan sizes it without params, use_ref only skips the dispatch)
-    const bool iqp = ggml_cpu_iqp_supports_mul_mat_id(dst) && !params->use_ref;
-
-    char * iqp_panels = NULL;
-
-    if (iqp) {
-        iqp_panels = incr_ptr_aligned(&wdata_cur, nth * ggml_cpu_iqp_scratch_size(dst), 64);
-    }
+    // Tiled matmul (see tiled.h); per-thread work buffers, 0 bytes when disabled. The
+    // reservation is unconditional, the per expert eligibility is decided at dispatch time
+    char * tiled_scratch = incr_ptr_aligned(&wdata_cur, ggml_tiled_wdata_size(nth, dst), 64);
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
@@ -1649,15 +1671,77 @@ static void ggml_compute_forward_mul_mat_id(
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
+        // llama MoE expert cache: when src[3] is set it is an I32 table mapping
+        // expert id -> device cache slot, with op_params[0] holding the "not
+        // cached" dummy value. Cached ids are served by the device-side cache
+        // chain, so this op skips them and zeroes their dst rows instead.
+        const int32_t * moe_tbl   = NULL;
+        int32_t         moe_dummy = 0;
+        if (dst->src[3]) {
+            moe_tbl   = (const int32_t *) dst->src[3]->data;
+            moe_dummy = ggml_get_op_params_i32(dst, 0);
+        }
+
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                assert(i02 < n_as);
+
+                // negative id: skipped expert (2-GPU prefill split, MoE cache), zero output row
+                if (i02 < 0 || (moe_tbl && moe_tbl[i02] != moe_dummy)) {
+                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    continue;
+                }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
+            }
+        }
+
+        // MoE routing observation for the llama expert cache
+        {
+            void * moe_obs_ud = NULL;
+            ggml_moe_obs_cb_t moe_obs_cb = ggml_get_moe_obs_callback(&moe_obs_ud);
+            // LLAMA_MOE_DEFER: the immediate op carries the layer's full ids in src[5]; deferred ops don't observe
+            if (moe_obs_cb && strstr(src0->name, "ffn_gate_exps") && strncmp(dst->name, "ffn_moe_defer", 13) != 0) {
+                moe_obs_cb(src0->name, dst->src[5] ? dst->src[5] : ids, dst, moe_obs_ud);
+            }
+        }
+
+        // GGML_MOE_LOG: append the routed expert ids of every ffn_gate_exps
+        // mul_mat_id to the file named by the env var. Diagnostic only; the
+        // whole block is inert unless GGML_MOE_LOG is set at first use.
+        {
+            static FILE * moe_log_file  = NULL;
+            static int    moe_log_state = -1;
+            if (moe_log_state == -1) {
+                const char * moe_log_path = getenv("GGML_MOE_LOG");
+                if (moe_log_path && moe_log_path[0]) {
+                    moe_log_file = fopen(moe_log_path, "a");
+                }
+                moe_log_state = moe_log_file ? 1 : 0;
+            }
+            if (moe_log_state == 1 && strstr(src0->name, "ffn_gate_exps")) {
+#ifdef _WIN32
+                _lock_file(moe_log_file);
+#else
+                flockfile(moe_log_file);
+#endif
+                for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                    fprintf(moe_log_file, "%s", src0->name);
+                    for (int id = 0; id < n_ids; ++id) {
+                        const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                        fprintf(moe_log_file, " %d", i02);
+                    }
+                    fputc('\n', moe_log_file);
+                }
+#ifdef _WIN32
+                _unlock_file(moe_log_file);
+#else
+                funlockfile(moe_log_file);
+#endif
             }
         }
     }
@@ -1677,10 +1761,8 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        if (iqp && ggml_cpu_iqp_mul_mat_id_min_batch(cne1)) {
-            ggml_compute_forward_mul_mat_id_iqp(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0),
-                                                iqp_panels);
-
+        // tiled takes over if profitable for this expert (see tiled.h)
+        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
             continue;
         }
 
@@ -1714,6 +1796,33 @@ static void ggml_compute_forward_mul_mat_id(
 
         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
 
+        // GGML_MOE_CCX_SPLIT=D (L3 domains), MoE-cache host experts only: fixed rows per thread instead of dynamic chunks. The first
+        // half of the threads computes the first half of the rows, the rest the second half, so with threads bound per
+        // CCX (OMP_PLACES) each half is read by one L3, which a prefetch thread on that CCX can warm beforehand
+        static int ccx_split = -1;
+        if (ccx_split < 0) {
+            const char * e = getenv("GGML_MOE_CCX_SPLIT");
+            ccx_split = e ? atoi(e) : 0;
+        }
+        if (ccx_split > 0 && dst->src[3] && nth >= ccx_split) {
+            // GGML_MOE_CCX_SPLIT=D: D L3 domains; threads [d*nth/D, (d+1)*nth/D) compute rows [d*nr0/D, (d+1)*nr0/D)
+            const int     D    = ccx_split;
+            const int     side = ith * D / nth;
+            const int     t0   = (side * nth + D - 1) / D;
+            const int     t1   = ((side + 1) * nth + D - 1) / D;
+            const int     lt   = ith - t0;
+            const int     nt   = t1 - t0;
+            const int64_t h0   = nr0 * side / D;
+            const int64_t h1   = nr0 * (side + 1) / D;
+            const int64_t r0   = h0 + (h1 - h0) * lt / nt;
+            const int64_t r1   = h0 + (h1 - h0) * (lt + 1) / nt;
+            if (r0 < r1) {
+                ggml_compute_forward_mul_mat_id_one_chunk(dst, src0, src1, ids, cur_a, r0, r1, 0, nr1,
+                        src0_cur, matrix_rows, row_size, src1_cont, wdata);
+            }
+            continue;
+        }
+
         while (current_chunk < nchunk0 * nchunk1) {
             const int64_t ith0 = current_chunk % nchunk0;
             const int64_t ith1 = current_chunk / nchunk0;
@@ -1736,6 +1845,56 @@ static void ggml_compute_forward_mul_mat_id(
 
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
+    }
+}
+
+// llama MoE expert cache: the host matmuls of uncached experts (src[3] = slot table) are the phases
+// where decode reads DDR4 for expert weights; the first thread in reports busy, the last one out idle,
+// so uploads can be timed around them
+static atomic_int g_moe_cpu_active;
+
+static void ggml_compute_forward_mul_mat_id(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    if (!dst->src[3]) {
+        ggml_compute_forward_mul_mat_id_impl(params, dst);
+        return;
+    }
+    void * ud = NULL;
+    ggml_moe_phase_cb_t cb = ggml_get_moe_phase_callback(&ud);
+    if (cb && atomic_fetch_add(&g_moe_cpu_active, 1) == 0) {
+        cb(1, ggml_moe_host_bytes(dst), ud);
+    }
+    // nothing on the host (every id cached, skipped or negative: fully cached layers, empty deferred runs): each thread
+    // zeroes its slice and returns, without quantizing src1 or the op's barriers (the graph barrier follows anyway);
+    // the router observation still happens
+    bool host_work = false;
+    {
+        const struct ggml_tensor * ids = dst->src[2];
+        const int32_t * tbl   = (const int32_t *) dst->src[3]->data;
+        const int32_t   dummy = ggml_get_op_params_i32(dst, 0);
+        for (int64_t t = 0; t < ids->ne[1] && !host_work; ++t) {
+            for (int64_t i = 0; i < ids->ne[0] && !host_work; ++i) {
+                const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
+                host_work = e >= 0 && tbl[e] == dummy;
+            }
+        }
+    }
+    if (!host_work && ggml_is_contiguous(dst)) {
+        const size_t n = ggml_nbytes(dst), a = n*params->ith/params->nth, b = n*(params->ith + 1)/params->nth;
+        memset((char *) dst->data + a, 0, b - a);
+        if (params->ith == 0) {
+            void * moe_obs_ud = NULL;
+            ggml_moe_obs_cb_t moe_obs_cb = ggml_get_moe_obs_callback(&moe_obs_ud);
+            if (moe_obs_cb && strstr(dst->src[0]->name, "ffn_gate_exps") && strncmp(dst->name, "ffn_moe_defer", 13) != 0) {
+                moe_obs_cb(dst->src[0]->name, dst->src[5] ? dst->src[5] : dst->src[2], dst, moe_obs_ud);
+            }
+        }
+    } else {
+        ggml_compute_forward_mul_mat_id_impl(params, dst);
+    }
+    if (cb && atomic_fetch_add(&g_moe_cpu_active, -1) == 1) { // fetch_add(-1): MSVC has only the add shim
+        cb(0, 0, ud);
     }
 }
 
@@ -2887,15 +3046,12 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_MUL_MAT:
                     {
                         const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
-
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
                         }
-
-                        // the IQ panel path needs one scratch panel per thread past the q8_K rows
-                        if (ggml_cpu_iqp_supports_mul_mat(node)) {
-                            cur = GGML_PAD(cur, 64) + n_tasks * ggml_cpu_iqp_scratch_size(node);
-                        }
+                        // Workspace for tiled (see tiled.h)
+                        cur = GGML_PAD(cur, 64);
+                        cur += ggml_tiled_wdata_size(n_tasks, node);
                     } break;
                 case GGML_OP_MUL_MAT_ID:
                     {
@@ -2915,10 +3071,9 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
-                        // the IQ panel path needs one scratch panel per thread on top of that
-                        if (ggml_cpu_iqp_supports_mul_mat_id(node)) {
-                            cur += n_tasks * ggml_cpu_iqp_scratch_size(node) + 64;
-                        }
+                        // Workspace for tiled (see tiled.h)
+                        cur = GGML_PAD(cur, 64);
+                        cur += ggml_tiled_wdata_size(n_tasks, node);
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
@@ -3165,7 +3320,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_barrier(state->threadpool);
         }
     }
-
 #ifdef GGML_USE_OPENMP
     GGML_PRINT_DEBUG("thread #%d compute-done cplan %p\n", state->ith, (const void *)cplan);
 #else

@@ -34,13 +34,15 @@ extern "C" {
     // Backend buffer type
     //
 
-    GGML_API const char *          ggml_backend_buft_name          (ggml_backend_buffer_type_t buft);
-    GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer  (ggml_backend_buffer_type_t buft, size_t size);
-    GGML_API size_t                ggml_backend_buft_get_alignment (ggml_backend_buffer_type_t buft);
-    GGML_API size_t                ggml_backend_buft_get_max_size  (ggml_backend_buffer_type_t buft);
-    GGML_API size_t                ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
-    GGML_API bool                  ggml_backend_buft_is_host       (ggml_backend_buffer_type_t buft);
-    GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device    (ggml_backend_buffer_type_t buft);
+    GGML_API const char *          ggml_backend_buft_name            (ggml_backend_buffer_type_t buft);
+    GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer    (ggml_backend_buffer_type_t buft, size_t size);
+    GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer_n  (ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
+    GGML_API size_t                ggml_backend_buft_get_alignment   (ggml_backend_buffer_type_t buft);
+    GGML_API size_t                ggml_backend_buft_get_max_size    (ggml_backend_buffer_type_t buft);
+    GGML_API size_t                ggml_backend_buft_get_alloc_size  (ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
+    GGML_API size_t                ggml_backend_buft_get_alloc_size_n(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
+    GGML_API bool                  ggml_backend_buft_is_host         (ggml_backend_buffer_type_t buft);
+    GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device      (ggml_backend_buffer_type_t buft);
 
     //
     // Backend buffer
@@ -114,6 +116,26 @@ extern "C" {
     // backend_dst will wait for the copy to complete before performing other operations
     // automatic fallback to sync copy if async is not supported
     GGML_API void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
+
+    // MoE expert source lookup: when the scheduler offloads a host-resident expert
+    // matmul it copies only the used experts to the device. If this callback returns
+    // true, expert `expert` of `weight` is already resident on `dev` at `*data` (same
+    // bytes, inside `*buffer`) and is copied device-to-device instead of over PCIe.
+    typedef bool (*ggml_backend_moe_src_cb_t)(const struct ggml_tensor * weight, int32_t expert, ggml_backend_dev_t dev,
+                                             const void ** data, ggml_backend_buffer_t * buffer, void * user_data);
+    GGML_API void ggml_backend_set_moe_src_callback(ggml_backend_moe_src_cb_t cb, void * user_data);
+
+    // MoE expert cache fill: after the used experts of `weight` were copied to `dev` for an
+    // offloaded matmul, the scheduler asks for each one whether the cache wants to keep it; if this
+    // returns true it copies the expert device-to-device (same stream) to `*data` in `*buffer`
+    typedef bool (*ggml_backend_moe_fill_cb_t)(const struct ggml_tensor * weight, int32_t expert, ggml_backend_dev_t dev,
+                                              void ** data, ggml_backend_buffer_t * buffer, void * user_data);
+    GGML_API void ggml_backend_set_moe_fill_callback(ggml_backend_moe_fill_cb_t cb, void * user_data);
+
+    // called before each non-CPU split is launched, while no split is executing on that backend
+    // (the MoE expert cache publishes prefetched experts here, between layers)
+    typedef void (*ggml_backend_split_cb_t)(ggml_backend_t backend, void * user_data);
+    GGML_API void ggml_backend_set_split_callback(ggml_backend_split_cb_t cb, void * user_data);
 
     GGML_API ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend);
 
@@ -370,6 +392,15 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // Configure full-tensor MoE expert prefetch on a scheduler (mindcontrol port of
+    // --prefetch-experts-slots). Only engages for splits whose MUL_MAT_ID weights are
+    // host-resident (GGML_BACKEND_BUFFER_USAGE_WEIGHTS, e.g. --n-cpu-moe) during large
+    // prefill batches; decode is unaffected (batch ids < 2*n_expert).
+    //   slots == 0  -> prefetch disabled (no memory overhead)
+    //   slots >= 2  -> prefetch enabled with 1-deep lookahead and per-split cross-stream wait;
+    //                  GPU staging cost = slots * max_expert_tensor. Capped at GGML_SCHED_MAX_PREFETCH_SLOTS.
+    GGML_API void                 ggml_backend_sched_set_prefetch_experts_slots(ggml_backend_sched_t sched, int slots);
+
     //
     // Meta backend
     //
@@ -400,6 +431,7 @@ extern "C" {
         //   - most tensors have n_segments == 1 and a contiguous slice of the tensor data
         //   - some tensors have an inhomogenenous data layout along the split axis,
         //     those tensors are divided into segments which are each individually split across devices
+        //     (this usually happens when multiple tensors are fused into a single one)
         //   - ne has one entry per segment and device and that segment repeats nr times,
         //     in total when accounting for repetitions the segments add up to ggml_tensor::ne for that axis,
         //     the outer/inner loops are over segments/devices like [seg0_dev0_r0, seg0_dev1_r0, seg0_dev0_r1, seg0_dev1_r1, seg1_dev0_r0, seg1_dev1_r0],

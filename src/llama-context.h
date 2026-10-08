@@ -42,6 +42,12 @@ struct llama_memory_buffer {
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
 struct llama_context {
+    bool moe_cache_defer = false; // see llama_moe_cache_defer()
+    int32_t trace_n_eval() const { return n_eval; }       // for the layer trace (--moe log=l64)
+    int32_t trace_n_p_eval() const { return n_p_eval; }
+    void set_eval_cb(); // the scheduler callback: the user's, or the layer trace (--moe log=l64) in front of it
+    bool moe_decoded = false;         // this context decoded a batch (the startup memory probes create contexts that never do: no state snapshot for them)
+    bool moe_observe_started = false; // the heat of a stock placement start is being counted (llama_moe_observe_start)
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
@@ -102,7 +108,12 @@ struct llama_context {
     size_t  get_sampled_probs_count(int32_t idx);
 
     const llama_token * get_sampled_candidates_ith(int32_t idx);
+    bool set_mtp_dsa_index_share(bool enabled);
+    bool set_mtp_dsa_selection(const int32_t * data, size_t size);
+    const int32_t * get_mtp_dsa_selection(size_t * size);
     size_t get_sampled_candidates_count(int32_t idx);
+
+    bool get_causal_attn() const;
 
     void attach_threadpool(
             ggml_threadpool_t threadpool,
@@ -111,6 +122,11 @@ struct llama_context {
     void detach_threadpool();
 
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
+
+    // decode thread-count autotune (single-token decode only): A/B slices of candidate thread counts on measured token time
+    void set_thread_autotune(bool on);
+    void thread_cap_from_probe(int32_t n_sat);
+    void set_batch_thread_autotune(bool on, int32_t n_max);
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
@@ -172,6 +188,10 @@ struct llama_context {
             llama_memory_context_i * mctx,
                        ggml_status & ret);
 
+    int encode(const llama_batch_ext & batch_inp);
+    int decode(const llama_batch_ext & batch_inp);
+
+    // compat version
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
 
@@ -334,9 +354,16 @@ private:
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
 
+    std::vector<int32_t> mtp_dsa_sel_raw;
+    std::vector<float> mtp_dsa_sel_mask;
+    std::vector<llama_seq_id> mtp_dsa_sel_seq;
+    std::vector<int32_t> mtp_dsa_sel;
+    size_t mtp_dsa_sel_width = 0;
+
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+    std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
 
     // Optional position-indexed host accumulation buffer for MTP deferred prefill.
     // When set (caller-owned host memory), the unmasked pre-norm extraction also
@@ -413,6 +440,7 @@ private:
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;
 
+    uint32_t n_input_tensors = 0; // number of tensors marked as input during the last graph reserve
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
@@ -476,6 +504,39 @@ private:
     mutable int64_t t_eval_us   = 0;
 
     mutable int64_t t_compute_start_us = 0;
+
+    struct thread_tune {
+        bool   on = false;
+        int    base = 0;                 // current best count
+        int    base0 = 0;                // the default the count started from (a saved decision is valid while it is unchanged)
+        int    cycles = 0, slice_len = 32, warm_len = 8; // the first cycle is short and quick (a one-shot run has no time for more)
+        bool   try_lo2 = false;          // base-2 was within 3% of the base last cycle: base-4 is worth a cycle too
+        bool   try_far = false;          // base+2 beat the base in every round last cycle (any amount): +4, +8, +16 are worth a cycle too
+        std::vector<int> cand;           // candidates of this cycle (base first)
+        int    slot = 0, tok = 0, warm = 0, hold = 0, hold_len = 4096;
+        std::vector<double> cur_sum;                 // running sum of the current slice
+        std::vector<std::vector<double>> slice;      // [candidate][round] slice means (us/token)
+        int    pending = -1;                         // candidate that won the previous cycle (needs a second win)
+    } thr;
+    void thread_tune_feed(int64_t dt_us);
+
+    // Batch (prompt) thread autotune: the same paired-slice test as the decode tuner, on full prompt batches scored in us/token.
+    // Prompt processing is compute-bound on the CPU side (unlike decode, which is memory-bound), so more threads than decode
+    // uses, up to the logical cores, often win. One batch per slice, 3 rounds per cycle, spread over as many prompts as it takes.
+    struct thread_tune_batch {
+        bool   on = false;
+        int    base = 0;
+        std::vector<int> cand;
+        int    slot = 0;
+        int64_t n_full = 0;                          // largest batch seen: only near-full batches are compared
+        std::vector<std::vector<double>> slice;      // [candidate][round] us/token
+        int    pending = -1;
+        int    hold = 0, hold_len = 4;               // full batches to wait before the next cycle
+        int    n_max = 0;                            // threads the batch pool has
+        int    base0 = 0;                            // the default the count started from
+        int64_t last_us = 0, last_tokens = 0;        // start and size of the previous prompt ubatch
+    } thrb;
+    void thread_tune_feed_batch(int64_t dt_us, int64_t n_tokens);
     mutable int64_t n_queued_tokens    = 0;
 
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)

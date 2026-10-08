@@ -1,4 +1,11 @@
 #include "llama-context.h"
+#include <fstream>
+#include <filesystem>
+#include <map>
+#include <thread>
+
+#include "llama-moecache.h"
+#include "llama-moestate.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -7,6 +14,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -19,9 +27,11 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 
 //
@@ -90,7 +100,9 @@ llama_context::llama_context(
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
-    balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
+    // MTP uses the embd input for the hidden state
+    balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd(),
+                llm_arch_supports_mixed_batch(model.arch) && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT)) {
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
@@ -163,7 +175,7 @@ llama_context::llama_context(
         cparams.ctx_other = params.ctx_other;
     }
 
-    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
+    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_QWEN4EXP || model.arch == LLM_ARCH_GLM5_NEXT) {
         if (model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr) {
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
@@ -291,10 +303,13 @@ llama_context::llama_context(
     }
 
     cparams.op_offload = params.op_offload;
+    cparams.prefetch_experts_slots = params.prefetch_experts_slots;
+    cparams.moe_cache = params.n_moe_cache_slots != 0;
     cparams.kv_unified = params.kv_unified;
 
     // initialized later
     cparams.pipeline_parallel = false;
+    cparams.training = false;
 
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
@@ -350,8 +365,13 @@ llama_context::llama_context(
     }
 
     if (!hparams.vocab_only) {
-        // GPU backends
-        for (const auto & dev : model.devices) {
+        // GPU backends; the offload GPU goes first: the scheduler offloads big-batch
+        // ops on host weights to the first backend that accepts them
+        std::vector<llama_device> devs = model.devices;
+        if (model.dev_offload < devs.size()) {
+            std::rotate(devs.begin(), devs.begin() + model.dev_offload, devs.begin() + model.dev_offload + 1);
+        }
+        for (const auto & dev : devs) {
             ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
             if (backend == nullptr) {
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
@@ -430,8 +450,8 @@ llama_context::llama_context(
             auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
 
             if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
-                // use the host buffer of the first device CPU for faster transfer of the intermediate state
-                const auto & dev = model.devices[0];
+                // use the host buffer of the offload device CPU for faster transfer of the intermediate state
+                const auto & dev = model.devices[model.dev_offload < model.devices.size() ? model.dev_offload : 0];
                 auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
                 if (host_buft) {
                     buft = host_buft;
@@ -505,7 +525,26 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        if (cparams.moe_cache) {
+            // multi-GPU prefill split: decided (and reserved) before the first compute-buffer reserve
+            std::vector<ggml_backend_dev_t> gpus;
+            for (auto & backend : backends) {
+                ggml_backend_dev_t d = ggml_backend_get_device(backend.get());
+                if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) { gpus.push_back(d); }
+            }
+            llama_moe_cache_prefill_decide(gpus);
+        }
+
         sched_reserve();
+
+        // the expert cache starts on the first non-warmup decode (moe_cache_start), so auto
+        // sizing (-1) sees the free VRAM left after every model and context is loaded,
+        // e.g. a speculative draft model the server loads after this context
+        cparams.moe_cache_slots   = params.n_moe_cache_slots;
+        cparams.moe_cache_inserts = params.n_moe_cache_inserts;
+        cparams.moe_cache_window  = params.n_moe_cache_window > 0 ? params.n_moe_cache_window : 64;
+        cparams.moe_predict       = std::max(0, params.n_moe_predict);
+        cparams.moe_predict_train = std::max(0, params.n_moe_predict_train);
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -525,7 +564,158 @@ llama_context::llama_context(
     }
 }
 
+
+// research (--moe log=l, log=l64): every generated token (l) or every 64th (l64), per layer the layer's output embedding (1 byte per float, hex) and the expert ids its router selected,
+// appended to layertrace.csv in the log directory: model,pos,layer,embhex,xhex,ids. Unsampled tokens answer "do not observe", so the graph runs as without it
+namespace {
+struct layer_trace_state {
+    llama_context * ctx = nullptr;
+    ggml_backend_sched_eval_callback user_cb = nullptr;
+    void * user_data = nullptr;
+    int every = 0;
+    bool ids_only = false;   // log=x: the selected expert ids only, no embeddings
+    std::string model;
+    std::string file;   // the model file name without .gguf and split suffix plus the start time, for <file>.<time>.routing
+    size_t nl_first = 0, k_first = 0, ne_first = 0;   // log=x: layers and experts per layer of the first complete sample; others are skipped
+    int last_pos = -1, seq = 0;   // log=x: a position that goes down is a new prompt: its own file (<file>-<seq>.routing)
+    std::map<int, std::string> hex, xhex, ids;
+    std::map<int, std::vector<int32_t>> idv;
+    std::map<int, std::vector<uint16_t>> prv;   // log=x: per layer the router probabilities of all experts (fp16): the relevance of every expert to this token   // log=x: per layer the selected experts of the sampled token   // per layer: output embedding, router input, selected experts
+};
+layer_trace_state g_lt;
+
+bool layer_trace_cb(struct ggml_tensor * t, bool ask, void * ud) {
+    const bool is_out  = strncmp(t->name, "l_out-", 6) == 0;
+    const bool is_topk = strncmp(t->name, "ffn_moe_topk-", 13) == 0;
+    const bool is_probs = g_lt.ids_only && strncmp(t->name, "ffn_moe_probs-", 14) == 0;   // after the gating function, before the selection bias
+    const bool is_x    = strncmp(t->name, "ffn_norm-", 9) == 0;   // the router's (and the experts') input: the normalised residual
+    bool mine = (g_lt.ids_only ? (is_topk || is_probs) : (is_out || is_topk || is_x)) && t->ne[1] == 1 && g_lt.ctx->trace_n_eval() > 0 && g_lt.ctx->trace_n_eval() % g_lt.every == 0;
+    if (ask) {
+        const bool theirs = g_lt.user_cb ? g_lt.user_cb(t, true, g_lt.user_data) : false;
+        return mine || theirs;
+    }
+    if (mine) {
+        const int il = atoi(strchr(t->name, '-') + 1);
+        if (is_probs) {
+            if (t->type == GGML_TYPE_F32) {
+                std::vector<float> f(t->ne[0]);
+                ggml_backend_tensor_get(t, f.data(), 0, f.size()*sizeof(float));
+                std::vector<uint16_t> h(f.size());
+                ggml_fp32_to_fp16_row(f.data(), (ggml_fp16_t *) h.data(), (int64_t) f.size());
+                g_lt.prv[il] = std::move(h);
+            }
+        } else if (is_topk && t->type == GGML_TYPE_I32 && t->ne[0] == (int64_t) g_lt.ctx->get_model().hparams.n_expert_used(il)) {   // one token's experts (a warm-up graph can pass n_tokens x k as one row)
+            std::vector<int32_t> v(t->ne[0]);
+            ggml_backend_tensor_get(t, v.data(), 0, v.size()*sizeof(int32_t));
+            if (g_lt.ids_only) {
+                g_lt.idv[il] = v;
+                if (il == (int) g_lt.ctx->get_model().hparams.n_layer() - 1) {   // the last layer closes the sample
+                    if (g_lt.nl_first == 0) { g_lt.nl_first = g_lt.idv.size(); g_lt.k_first = v.size(); g_lt.ne_first = g_lt.prv.size() == g_lt.idv.size() ? g_lt.prv.begin()->second.size() : 0; }
+                    if (g_lt.idv.size() != g_lt.nl_first || v.size() != g_lt.k_first || (g_lt.ne_first && (g_lt.prv.size() != g_lt.idv.size() || g_lt.prv.begin()->second.size() != g_lt.ne_first))) { g_lt.idv.clear(); g_lt.prv.clear(); return g_lt.user_cb ? g_lt.user_cb(t, false, g_lt.user_data) : true; }   // incomplete sample
+                    // version 2 (this): header "MOER", u16 2, u16 layers, u16 k, u16 n_expert (0: no probabilities), u16 layer numbers; per token i32 pos, layers x k u16 ids, then
+                    // layers x n_expert fp16 router probabilities (the relevance of every expert to the token, from the router the model computes anyway)
+                    // <model file>[.<tag>].<YYYYmmdd-HHMMSS>.routing (tag = --moe tag=NAME, run.py sets test-prompt; one file per prompt: a position that goes down starts <file>-<n>.routing), little endian: once "MOER", u16 version 1, u16 layers, u16 k, u16 layer numbers;
+                    // then per sampled token i32 pos and layers x k u16 expert ids (layer order as in the header). A run starts where pos goes down.
+                    { const int cur = g_lt.ctx->trace_n_p_eval() + g_lt.ctx->trace_n_eval(); if (cur < g_lt.last_pos) { g_lt.seq++; } g_lt.last_pos = cur; }
+                    const std::filesystem::path path = moe_log_file(("routing/" + g_lt.file + (g_lt.seq ? "-" + std::to_string(g_lt.seq) : std::string()) + ".routing").c_str());
+                    std::error_code ec;
+                    std::filesystem::create_directories(path.parent_path(), ec);   // <logdir>/routing/
+                    const bool fresh = !std::filesystem::exists(path, ec) || std::filesystem::file_size(path, ec) == 0;
+                    const uint16_t k = (uint16_t) v.size();
+                    std::string out;
+                    auto put = [&](const void * p, size_t n) { out.append((const char *) p, n); };
+                    if (fresh) {
+                        const uint16_t ver = 2, nl = (uint16_t) g_lt.idv.size(), ne = (uint16_t) g_lt.ne_first;
+                        put("MOER", 4); put(&ver, 2); put(&nl, 2); put(&k, 2); put(&ne, 2);
+                        for (const auto & e : g_lt.idv) { const uint16_t l = (uint16_t) e.first; put(&l, 2); }
+                    }
+                    const int32_t pos = g_lt.ctx->trace_n_p_eval() + g_lt.ctx->trace_n_eval();
+                    put(&pos, 4);
+                    for (const auto & e : g_lt.idv) {
+                        for (uint16_t i = 0; i < k; ++i) { const uint16_t id = i < e.second.size() ? (uint16_t) e.second[i] : 0xffff; put(&id, 2); }
+                    }
+                    if (g_lt.ne_first) {
+                        for (const auto & e : g_lt.prv) { put(e.second.data(), e.second.size()*2); }
+                    }
+                    std::ofstream f(path, std::ios::app | std::ios::binary);
+                    f.write(out.data(), (std::streamsize) out.size());
+                    g_lt.idv.clear(); g_lt.prv.clear();
+                }
+            } else {
+                std::string o;
+                for (size_t i = 0; i < v.size(); ++i) { o += (i ? " " : "") + std::to_string(v[i]); }
+                g_lt.ids[il] = o;
+            }
+        } else if (is_x && t->type == GGML_TYPE_F32) {
+            // fixed scale, clipped at +-16 (int8, 2 hex characters per dim): unlike the per-token absmax scale of the output embedding, the outlier dims do not hide the rest
+            std::vector<float> v(t->ne[0]);
+            ggml_backend_tensor_get(t, v.data(), 0, v.size()*sizeof(float));
+            std::string h;
+            h.reserve(v.size()*2);
+            char b[4];
+            for (float x : v) { snprintf(b, sizeof b, "%02x", (unsigned) (uint8_t) (int8_t) std::lround(std::max(-16.0f, std::min(16.0f, x))*(127.0f/16.0f))); h += b; }
+            g_lt.xhex[il] = h;
+        } else if (is_out && t->type == GGML_TYPE_F32) {
+            std::vector<float> v(t->ne[0]);
+            ggml_backend_tensor_get(t, v.data(), 0, v.size()*sizeof(float));
+            float mx = 1e-20f;
+            for (float x : v) { mx = std::max(mx, std::fabs(x)); }
+            std::string h;
+            h.reserve(v.size()*2);
+            char b[4];
+            for (float x : v) { snprintf(b, sizeof b, "%02x", (unsigned) (uint8_t) (int8_t) std::lround(x/mx*127.0f)); h += b; }
+            g_lt.hex[il] = h;
+            if (il == (int) g_lt.ctx->get_model().hparams.n_layer() - 1) {   // the last layer closes the sample
+                const std::filesystem::path path = moe_log_file("layertrace.csv");
+                std::error_code ec;
+                const bool fresh = !std::filesystem::exists(path, ec) || std::filesystem::file_size(path, ec) == 0;
+                std::string out = fresh ? "model,pos,layer,embhex,xhex,ids\n" : "";
+                const int pos = g_lt.ctx->trace_n_p_eval() + g_lt.ctx->trace_n_eval();
+                for (const auto & e : g_lt.hex) { out += g_lt.model + "," + std::to_string(pos) + "," + std::to_string(e.first) + "," + e.second + "," + (g_lt.xhex.count(e.first) ? g_lt.xhex[e.first] : "") + "," + (g_lt.ids.count(e.first) ? g_lt.ids[e.first] : "") + "\n"; }
+                std::ofstream o(path, std::ios::app | std::ios::binary);
+                o.write(out.data(), (std::streamsize) out.size());
+                g_lt.hex.clear(); g_lt.xhex.clear(); g_lt.ids.clear();
+            }
+        }
+    }
+    return g_lt.user_cb ? g_lt.user_cb(t, false, g_lt.user_data) : true;
+}
+}  // namespace
+
+void llama_context::set_eval_cb() {
+    if ((moe_log_has("l") || moe_log_has("x")) && moe_state_enabled() && (g_lt.ctx == nullptr || g_lt.ctx == this)) {   // the first context only: a draft context has its own layers and would interleave
+        g_lt.ids_only = !moe_log_has("l");
+        g_lt.ctx = this; g_lt.user_cb = cparams.cb_eval; g_lt.user_data = cparams.cb_eval_user_data;
+        g_lt.every = std::max(1, moe_log_num(g_lt.ids_only ? 'x' : 'l', 1));   // log=l: every token, log=l64: every 64th; log=x: ids only, same sampling
+        if (g_lt.file.empty()) {   // once per process: the file name (model, tag, start time)
+            g_lt.model = moe_state_section(model);
+            for (char & c : g_lt.model) { if (c == ',' || c == '\n') { c = '_'; } }
+            g_lt.file = moe_run_stem(g_lt.model);   // the same stem for every research file of the run (routing, cache pressure)
+        }
+        ggml_backend_sched_set_eval_callback(sched.get(), layer_trace_cb, nullptr);
+    } else {
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+    }
+}
+
 llama_context::~llama_context() {
+    if (g_lt.ctx == this) { g_lt.ctx = nullptr; }   // research trace (log=l, log=x): the callback state must not point at a freed context
+    if (moe_embsnap_enabled()) {   // research (--moe log=e): at exit only, the last layer embedding of the last token of the last graph; nothing is read while running
+        synchronize();
+        llm_graph_result * r = gf_res_prev_active ? gf_res_prev_active : gf_res_prev[0].get();
+        ggml_tensor * te = r ? r->get_embd() : nullptr;
+        if (te && te->buffer && te->ne[1] > 0) {
+            std::vector<float> row(te->ne[0]);
+            ggml_backend_tensor_get(te, row.data(), (size_t) (te->ne[1] - 1)*te->nb[1], row.size()*sizeof(float));
+            moe_embsnap_set(row.data(), (int) row.size());
+        }
+    }
+    if (cparams.moe_cache) {
+        llama_moe_cache_free();
+    } else if (moe_observe_started) {
+        llama_moe_observe_save();
+    }
+    if (moe_decoded) { moe_snap_save(moe_state_section(model)); }   // research (--moe log=s): the model's state section after the run's last write
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -652,6 +842,37 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 }
 
+static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
+    std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> users;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        if (node->flags & GGML_TENSOR_FLAG_INPUT) {
+            users[node].push_back(node);
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            ggml_tensor * src = node->src[j];
+            if (!src) {
+                break;
+            }
+            if (src->flags & GGML_TENSOR_FLAG_INPUT) {
+                users[src].push_back(node);
+            }
+        }
+    }
+
+    for (const auto & [tensor, nodes] : users) {
+        GGML_ASSERT(tensor->op == GGML_OP_NONE);
+        for (const ggml_tensor * node : nodes) {
+            LLAMA_LOG_DEBUG("%s: input tensor '%32s' [%s, ne = { %5" PRId64 ", %5" PRId64 ", %5" PRId64 ", %5" PRId64 " }] is used by node '%s' (%s)\n",
+                    __func__, tensor->name, ggml_type_name(tensor->type),
+                    tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+                    node->name, ggml_op_name(node->op));
+        }
+    }
+
+    return (int) users.size();
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -761,11 +982,15 @@ void llama_context::sched_reserve() {
     }
 
     // reserve worst-case graph
-    int n_splits_pp = -1;
-    int n_nodes_pp  = -1;
+    int n_splits_pp        = -1;
+    int n_nodes_pp         = -1;
+    int n_inputs_pp        = -1;
+    int n_input_tensors_pp = -1;
 
-    int n_splits_tg = -1;
-    int n_nodes_tg  = -1;
+    int n_splits_tg        = -1;
+    int n_nodes_tg         = -1;
+    int n_inputs_tg        = -1;
+    int n_input_tensors_tg = -1;
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
@@ -785,19 +1010,27 @@ void llama_context::sched_reserve() {
             }
         }
 
-        n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
-        n_nodes_pp  = ggml_graph_n_nodes(gf);
+        n_splits_pp        = ggml_backend_sched_get_n_splits(sched.get());
+        n_nodes_pp         = ggml_graph_n_nodes(gf);
+        n_inputs_pp        = get_gf_res_reserve()->inputs.size();
+        n_input_tensors_pp = this->n_input_tensors;
     }
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
-    {
+    if (cparams.training) {
+        // no tg graph for training
+        n_splits_tg = n_splits_pp;
+        n_nodes_tg  = n_nodes_pp;
+    } else {
         auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
 
-        n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
-        n_nodes_tg  = ggml_graph_n_nodes(gf);
+        n_splits_tg        = ggml_backend_sched_get_n_splits(sched.get());
+        n_nodes_tg         = ggml_graph_n_nodes(gf);
+        n_inputs_tg        = get_gf_res_reserve()->inputs.size();
+        n_input_tensors_tg = this->n_input_tensors;
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
@@ -835,16 +1068,21 @@ void llama_context::sched_reserve() {
         }
     }
 
-    if (n_nodes_pp == n_nodes_tg) {
-        LLAMA_LOG_INFO("%s: graph nodes  = %d\n", __func__, n_nodes_pp);
-    } else {
-        LLAMA_LOG_INFO("%s: graph nodes  = %d (with bs=%d), %d (with bs=1)\n", __func__, n_nodes_pp, n_tokens, n_nodes_tg);
-    }
+    {
+        const bool diff = n_nodes_pp != n_nodes_tg || n_splits_pp != n_splits_tg ||
+                          n_inputs_pp != n_inputs_tg || n_input_tensors_pp != n_input_tensors_tg;
 
-    if (n_splits_pp == n_splits_tg) {
-        LLAMA_LOG_INFO("%s: graph splits = %d\n", __func__, n_splits_pp);
-    } else {
-        LLAMA_LOG_INFO("%s: graph splits = %d (with bs=%d), %d (with bs=1)\n", __func__, n_splits_pp, n_tokens, n_splits_tg);
+        const auto val = [diff](int v_pp, int v_tg) -> std::string {
+            return diff ? format("%d / %d", v_pp, v_tg) : format("%d", v_pp);
+        };
+
+        LLAMA_LOG_INFO("%s: graph%s: nodes = %s, splits = %s, input objects = %s, input tensors = %s\n",
+                __func__,
+                diff ? format(" (pp bs=%d, tg bs=%d)", n_tokens, n_seqs).c_str() : "",
+                val(n_nodes_pp, n_nodes_tg).c_str(),
+                val(n_splits_pp, n_splits_tg).c_str(),
+                val(n_inputs_pp, n_inputs_tg).c_str(),
+                val(n_input_tensors_pp, n_input_tensors_tg).c_str());
     }
 
     const int64_t t_end_us = ggml_time_us();
@@ -869,6 +1107,7 @@ void llama_context::synchronize() {
         if (!cparams.no_perf) {
             t_eval_us += ggml_time_us() - t_compute_start_us;
         }
+        thread_tune_feed(ggml_time_us() - t_compute_start_us);
         n_eval++;
     } else if (n_queued_tokens > 1) {
         if (!cparams.no_perf) {
@@ -1126,6 +1365,74 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     }
 }
 
+bool llama_context::set_mtp_dsa_index_share(bool enabled) {
+    if (model.arch != LLM_ARCH_GLM5_NEXT || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || memory == nullptr) {
+        return false;
+    }
+
+    enabled = enabled && model.hparams.indexer_index_share_mtp;
+
+    auto * mem = static_cast<llama_memory_hybrid_idx *>(memory.get());
+    if (mem->get_mtp_dsa_index_share() != enabled) {
+        mem->set_mtp_dsa_index_share(enabled);
+        sched_need_reserve = true;
+    }
+
+    return enabled;
+}
+
+bool llama_context::set_mtp_dsa_selection(const int32_t * data, size_t size) {
+    if (model.arch != LLM_ARCH_GLM5_NEXT || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || memory == nullptr) {
+        return false;
+    }
+
+    auto * mem = static_cast<llama_memory_hybrid_idx *>(memory.get());
+    if (!mem->get_mtp_dsa_index_share()) {
+        return false;
+    }
+
+    mem->set_mtp_dsa_selection(data, size);
+    return true;
+}
+
+const int32_t * llama_context::get_mtp_dsa_selection(size_t * size) {
+    if (size != nullptr) {
+        *size = 0;
+    }
+    if (mtp_dsa_sel_raw.empty() || mtp_dsa_sel_raw.size() != mtp_dsa_sel_mask.size() || mtp_dsa_sel_width == 0) {
+        return nullptr;
+    }
+    GGML_ASSERT(memory != nullptr && model.arch == LLM_ARCH_GLM5_NEXT);
+    GGML_ASSERT(mtp_dsa_sel_raw.size() == mtp_dsa_sel_width*mtp_dsa_sel_seq.size());
+
+    auto * mem = static_cast<llama_memory_hybrid_idx *>(memory.get());
+    auto * mem_idx = mem->get_mem_idx();
+    GGML_ASSERT(mem_idx != nullptr);
+
+    mtp_dsa_sel.resize(mtp_dsa_sel_raw.size());
+    for (size_t row = 0; row < mtp_dsa_sel_seq.size(); ++row) {
+        const llama_seq_id seq_id = mtp_dsa_sel_seq[row];
+        GGML_ASSERT(seq_id >= 0);
+        const auto & cells = mem_idx->get_cells(seq_id);
+
+        for (size_t j = 0; j < mtp_dsa_sel_width; ++j) {
+            const size_t i = row*mtp_dsa_sel_width + j;
+            const int32_t cell = mtp_dsa_sel_raw[i];
+            if (mtp_dsa_sel_mask[i] != 0.0f) {
+                mtp_dsa_sel[i] = -1;
+                continue;
+            }
+            GGML_ASSERT(cell >= 0 && (uint32_t) cell < cells.size());
+            GGML_ASSERT(!cells.is_empty((uint32_t) cell) && cells.seq_has((uint32_t) cell, seq_id));
+            mtp_dsa_sel[i] = cells.pos_get((uint32_t) cell);
+        }
+    }
+    if (size != nullptr) {
+        *size = mtp_dsa_sel.size();
+    }
+    return mtp_dsa_sel.data();
+}
+
 float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
     output_reorder();
 
@@ -1279,6 +1586,263 @@ void llama_context::detach_threadpool() {
 
     this->threadpool       = nullptr;
     this->threadpool_batch = nullptr;
+}
+
+// Decode thread autotune. The default count is a formula (cores minus one per GPU); the best count depends on the CPU, its
+// memory and how much of the model runs on it. Every `hold` tokens: candidates {base, base-2, base+2} in interleaved
+// 32-token slices (3 rounds, 8 warm-up tokens each). Decode times are noisy and correlated, so the decision uses slice means
+// paired by round: a candidate must beat the base in EVERY round (by half the base's own spread, 0.5-3%), the cycle is void when the base's own slices differ by
+// more than 25%, and a candidate must win two cycles in a row before it replaces the base. The interval doubles (4096 ..
+// 65536 tokens) while the base is confirmed. LLAMA_THREAD_AUTOTUNE=0 turns it off.
+// the tuned thread counts of this model on this machine are kept in the state file as "<default> <tuned>", valid while the default
+// is unchanged: a short session (one reply, no time for a cycle) starts from what an earlier one found
+static int threads_saved(const llama_model & model, const char * key, int dflt) {
+    std::string v;
+    int d = 0, t = 0;
+    return moe_state_get(moe_state_section(model), key, v) && sscanf(v.c_str(), "%d %d", &d, &t) == 2 && d == dflt && t >= 2 ? t : 0;
+}
+
+// how many sessions used this saved value: it is explored again every 8th session, the others start from it and measure nothing
+static int threads_runs_bump(const llama_model & model, const char * key) {
+    std::string v;
+    int n = 0;
+    if (moe_state_get(moe_state_section(model), key, v)) { n = atoi(v.c_str()); }
+    n++;
+    moe_state_set(moe_state_section(model), { { key, std::to_string(n) } });
+    return n;
+}
+
+static void threads_save(const llama_model & model, const char * key, int dflt, int tuned) {
+    moe_state_set(moe_state_section(model), { { key, std::to_string(dflt) + " " + std::to_string(tuned) } });
+}
+
+void llama_context::set_thread_autotune(bool on) {
+    const char * e = moe_opt("thread-tune");
+    if (e && atoi(e) == 0) { on = false; }
+    thr.on    = on;
+    thr.base0 = (int) cparams.n_threads;
+    thr.base  = thr.base0;
+    thr.hold  = 40;  // the first tokens run on the default (the counter runs across requests)
+    // the thread pool is created for the default count after this call: a saved count above it cannot run, so only lower ones apply
+    if (on) {
+        if (const int s = threads_saved(model, "threads", thr.base0)) {
+            thr.base = std::min(s, thr.base0);
+            cparams.n_threads = (uint32_t) thr.base;
+        }
+    }
+}
+
+// the startup probe knows how many reader threads saturate the RAM read rate; decode does arithmetic on every byte it reads (dequantizing), so it needs
+// a few times that many (PC1: saturated by 2, best decode 6) but not the cores-minus-GPUs formula's 60 on a 64-core host, where every thread adds a
+// barrier to each small expert matmul. A tuned count saved by an earlier session stands.
+void llama_context::thread_cap_from_probe(int32_t n_sat) {
+    if (!thr.on || n_sat <= 0 || thr.base != thr.base0) {
+        return;
+    }
+    const int cap = std::max(4, 3*(int) n_sat);
+    if (cap < thr.base) {
+        LLAMA_LOG_INFO("%s: decode threads %d -> %d (the RAM read rate is saturated by %d threads; the tuner starts from here)\n", __func__, thr.base, cap, (int) n_sat);
+        thr.base = cap;
+        cparams.n_threads = (uint32_t) cap;
+    }
+}
+
+void llama_context::set_batch_thread_autotune(bool on, int32_t n_max) {
+    const char * e = moe_opt("thread-tune");
+    if (e && atoi(e) == 0) { on = false; }
+    // off unless asked for (LLAMA_BATCH_THREAD_AUTOTUNE=1): a cycle needs 15 full batches after a two-batch hold, a prompt of up to ~16k tokens ends before it can decide
+    // (and so before anything is saved), so every start explored five thread counts, SMT siblings included, and paid ~5% of the prompt (CPU only, OLMoE, 4k tokens)
+    const char * b = moe_opt("batch-tune");
+    if (!(b && atoi(b) != 0)) { on = false; }
+    thrb.on    = on;
+    thrb.n_max = n_max;
+    thrb.base0 = (int) cparams.n_threads_batch;
+    thrb.base  = thrb.base0;
+    if (on) {
+        if (const int s = threads_saved(model, "threads_batch", thrb.base0)) {
+            thrb.base = std::min(s, std::max(n_max, thrb.base0));
+            cparams.n_threads_batch = (uint32_t) thrb.base;
+            // a count measured by an earlier session (adopted, or the default confirmed best) stands: exploring five thread counts costs a
+            // few percent of every short prompt, so it is only repeated every 8th session
+            if (threads_runs_bump(model, "threads_batch_runs") % 8 != 0) {
+                thrb.hold_len = 1 << 30;
+                thrb.hold = thrb.hold_len;
+                return;
+            }
+        }
+    }
+    thrb.hold = 2;  // the first full batches run on the default
+}
+
+void llama_context::thread_tune_feed_batch(int64_t dt_us, int64_t n_tokens) {
+    if (!thrb.on || cparams.n_threads_batch < 2 || n_tokens < 64) {
+        return;
+    }
+    thrb.n_full = std::max(thrb.n_full, n_tokens);
+    if (n_tokens < thrb.n_full*9/10) {
+        return; // a short tail batch: its per-token time is not comparable
+    }
+    auto set = [&](int n) { cparams.n_threads_batch = (uint32_t) n; };
+    if (thrb.cand.empty()) {
+        if (thrb.hold > 0 && --thrb.hold > 0) { return; }
+        const int hw   = std::max(2, (int) std::thread::hardware_concurrency());
+        const int base = thrb.base;
+        // an attached thread pool has a fixed size: never ask for more threads than it has (the caller says how many)
+        const int cap = threadpool_batch ? std::max(base, thrb.n_max) : hw;
+        std::vector<int> c = { base };
+        for (int n : { base - 2, base + 2, base + 4, hw }) {
+            n = std::min(n, cap);
+            if (n >= 2 && n != base && std::find(c.begin(), c.end(), n) == c.end()) { c.push_back(n); }
+        }
+        if (c.size() < 2) { thrb.hold = thrb.hold_len; return; }
+        thrb.cand = c; thrb.slot = 0;
+        thrb.slice.assign(c.size(), {});
+        set(c[0]);
+        return;
+    }
+    // this batch ran on cand[slot % n]
+    const size_t k = (size_t) thrb.slot % thrb.cand.size();
+    thrb.slice[k].push_back((double) dt_us / (double) n_tokens);
+    if (++thrb.slot < (int) thrb.cand.size()*3) {
+        set(thrb.cand[(size_t) thrb.slot % thrb.cand.size()]);
+        return;
+    }
+    // decide on paired rounds: a candidate must beat the base in EVERY round; two winning cycles in a row to replace it
+    auto mean = [&](size_t i) { double m = 0; for (double x : thrb.slice[i]) { m += x; } return m/std::max<size_t>(1, thrb.slice[i].size()); };
+    const auto & b0 = thrb.slice[0];
+    const double bmin = *std::min_element(b0.begin(), b0.end()), bmax = *std::max_element(b0.begin(), b0.end());
+    const bool noisy = bmax > 1.25*bmin;
+    // same rule as the decode tuner: more threads must win in every round by the noise-scaled bar, fewer threads must not lose by more than 1%
+    int best = -1, fewest = -1;
+    const double win = std::min(0.03, std::max(0.005, 0.5*(bmax/bmin - 1))); // noise-scaled bar for more threads, 0.5% to 3%
+    if (!noisy) {
+        for (size_t i = 1; i < thrb.cand.size(); ++i) {
+            const bool fewer = thrb.cand[i] < thrb.cand[0];
+            bool all = thrb.slice[i].size() == b0.size();
+            for (size_t r = 0; all && r < b0.size(); ++r) { all = thrb.slice[i][r] < (fewer ? 1.01 : 1.0 - win)*b0[r]; }
+            if (!all) { continue; }
+            if (fewer) { if (fewest < 0 || thrb.cand[i] < thrb.cand[(size_t) fewest]) { fewest = (int) i; } }
+            else if (best < 0 || mean(i) < mean((size_t) best)) { best = (int) i; }
+        }
+    }
+    if (best < 0) { best = fewest; }
+    const int cand_best = best >= 0 ? thrb.cand[(size_t) best] : -1;
+    const bool adopt = cand_best >= 0 && cand_best == thrb.pending;
+    std::string msg;
+    for (size_t i = 1; i < thrb.cand.size(); ++i) { msg += " | " + std::to_string(thrb.cand[i]) + ": " + std::to_string(1e6/mean(i)).substr(0, 6); }
+    LLAMA_LOG_INFO("%s: batch thread autotune: base %d %.1f tokens/s%s%s -> %d%s\n", __func__, thrb.cand[0], 1e6/mean(0), msg.c_str(),
+            noisy ? " (noisy, void)" : "", adopt ? cand_best : thrb.cand[0], (cand_best >= 0 && !adopt) ? " (leads, confirming)" : "");
+    if (adopt) { thrb.base = cand_best; thrb.pending = -1; thrb.hold_len = 8; thrb.hold = thrb.hold_len; threads_save(model, "threads_batch", thrb.base0, cand_best); }
+    else if (cand_best >= 0) { thrb.pending = cand_best; thrb.hold = 1; }   // confirm at the next full batch
+    else {
+        thrb.pending = -1; thrb.hold_len = std::min(thrb.hold_len*2, 64); thrb.hold = thrb.hold_len;
+        // a clean cycle in which nothing beat the base: remember the base, the next sessions do not repeat the measurement
+        if (!noisy) { threads_save(model, "threads_batch", thrb.base0, thrb.base); }
+    }
+    set(thrb.base);
+    thrb.cand.clear();
+}
+
+void llama_context::thread_tune_feed(int64_t dt_us) {
+    if (!thr.on || cparams.n_threads < 2) {
+        return;
+    }
+    auto set = [&](int n) { cparams.n_threads = (uint32_t) n; };
+    if (thr.cand.empty()) {
+        if (thr.hold > 0) {
+            if (--thr.hold > 0) { return; }
+        }
+        const int hw   = std::max(2, (int) std::thread::hardware_concurrency());
+        const int base = thr.base;
+        std::vector<int> c = { base };
+        // an attached thread pool (llama-cli) has a fixed size: never ask for more threads than it has
+        const int cap = (threadpool || threadpool_batch) ? base : hw;
+        // climb by 2: the start is already bounded by the probe (thread_cap_from_probe), a win is followed at once by the next step (below)
+        const int step = 2;
+        const int lo = std::max(2, base - step), hi = std::min(cap, base + step), lo2 = std::max(2, base - 2*step);
+        if (lo != base) { c.push_back(lo); }
+        // a far lower count costs a slow slice per round: only when the nearer one looked close to the base
+        if (thr.try_lo2 && lo2 != lo && lo2 != base) { c.push_back(lo2); }
+        if (hi != base) { c.push_back(hi); }
+        // far candidates (+4, +8, +16) only while the last cycle showed a trend (base+2 ahead in every round): a slow gradient shows at four to eight times the size,
+        // but a far count costs a slice per round, so it is not tried blindly
+        if (thr.try_far) {
+            for (int d : { 4, 8, 16 }) {
+                const int n = std::min(cap, base + d);
+                if (n > base && std::find(c.begin(), c.end(), n) == c.end()) { c.push_back(n); }
+            }
+        }
+        if (c.size() < 2) { thr.hold = thr.hold_len; return; }
+        // the first cycle of a session is short (12-token slices, 3 skipped) so one-shot runs get a decision; later ones use 32 / 8
+        thr.slice_len = thr.cycles == 0 ? 12 : 32; thr.warm_len = thr.cycles == 0 ? 3 : 8;
+        thr.cand = c; thr.slot = 0; thr.tok = 0; thr.warm = thr.warm_len;
+        thr.cur_sum.assign(1, 0.0);
+        thr.slice.assign(c.size(), {});
+        set(c[0]);
+        return;
+    }
+    if (thr.warm > 0) { --thr.warm; return; }
+    thr.cur_sum[0] += (double) dt_us;
+    if (++thr.tok < thr.slice_len) { return; }
+    const size_t k = (size_t) thr.slot % thr.cand.size();
+    thr.slice[k].push_back(thr.cur_sum[0]/(double) thr.slice_len);
+    thr.cur_sum[0] = 0.0; thr.tok = 0; thr.warm = thr.warm_len;
+    if (++thr.slot < (int) thr.cand.size()*3) {
+        set(thr.cand[(size_t) thr.slot % thr.cand.size()]);
+        return;
+    }
+    // decide on paired slice means
+    auto mean = [&](size_t i) { double m = 0; for (double x : thr.slice[i]) { m += x; } return m/std::max<size_t>(1, thr.slice[i].size()); };
+    const auto & b0 = thr.slice[0];
+    const double bmin = *std::min_element(b0.begin(), b0.end()), bmax = *std::max_element(b0.begin(), b0.end());
+    const bool noisy = bmax > 1.25*bmin;
+    // more threads must win in every round by a noise-scaled bar (0.5-3%); fewer threads only must not lose by more than 1% (a tie favors fewer: less power,
+    // cores left for launches and uploads). The fastest winner with more threads beats the lowest count among the ties.
+    int best = -1, fewest = -1;
+    // the bar for more threads follows the measured noise: half the base's own round-to-round spread, between 0.5% and 3%
+    const double win = std::min(0.03, std::max(0.005, 0.5*(bmax/bmin - 1)));
+    if (!noisy) {
+        for (size_t i = 1; i < thr.cand.size(); ++i) {
+            const bool fewer = thr.cand[i] < thr.cand[0];
+            // more threads must pay for the cores they take: at least 0.25% per added thread (+2: 0.5%, +8: 2%, +16: 4%), on top of the noise bar
+            const double bar = fewer ? 0.0 : std::min(0.08, std::max(win, 0.0025*(thr.cand[i] - thr.cand[0])));
+            bool all = thr.slice[i].size() == b0.size();
+            for (size_t r = 0; all && r < b0.size(); ++r) { all = thr.slice[i][r] < (fewer ? 1.01 : 1.0 - bar)*b0[r]; }
+            if (!all) { continue; }
+            if (fewer) { if (fewest < 0 || thr.cand[i] < thr.cand[(size_t) fewest]) { fewest = (int) i; } }
+            else if (best < 0 || mean(i) < mean((size_t) best)) { best = (int) i; }
+        }
+    }
+    if (best < 0) { best = fewest; }
+    thr.try_far = false;
+    for (size_t i = 1; i < thr.cand.size(); ++i) {   // a trend: base+2 ahead of the base in every round, by any amount
+        if (thr.cand[i] != thr.cand[0] + 2 || thr.slice[i].size() != b0.size()) { continue; }
+        bool ahead = true;
+        for (size_t r = 0; r < b0.size(); ++r) { ahead = ahead && thr.slice[i][r] < b0[r]; }
+        thr.try_far = thr.try_far || ahead;
+    }
+    thr.try_lo2 = false;
+    for (size_t i = 1; i < thr.cand.size(); ++i) {
+        if (thr.cand[i] >= thr.cand[0] || thr.slice[i].size() != b0.size()) { continue; }
+        bool close = true;
+        for (size_t r = 0; r < b0.size(); ++r) { close = close && thr.slice[i][r] < 1.03*b0[r]; }
+        thr.try_lo2 = thr.try_lo2 || close;
+    }
+    const int cand_best = best >= 0 ? thr.cand[(size_t) best] : -1;
+    // two cycles in a row must win in the same direction (a win at +8 and then at +4 is still a gain): the more conservative of the two is adopted
+    const bool adopt = cand_best >= 0 && thr.pending >= 0 && ((cand_best > thr.cand[0]) == (thr.pending > thr.cand[0]));
+    const int adopted = !adopt ? thr.cand[0] : (cand_best > thr.cand[0] ? std::min(cand_best, thr.pending) : std::max(cand_best, thr.pending));
+    std::string msg;
+    for (size_t i = 1; i < thr.cand.size(); ++i) { msg += " | " + std::to_string(thr.cand[i]) + ": " + std::to_string(mean(i)/1000.0).substr(0, 5); }
+    LLAMA_LOG_INFO("%s: thread autotune: base %d %.2f ms/token%s%s -> %d%s\n", __func__, thr.cand[0], mean(0)/1000.0, msg.c_str(),
+            noisy ? " (noisy, void)" : "", adopted, (cand_best >= 0 && !adopt) ? " (leads, confirming)" : "");
+    // an adopted step keeps climbing: the next cycle follows after 128 tokens; a cycle without a win is the plateau, then the rest grows as before
+    if (adopt) { thr.base = adopted; thr.hold_len = 4096; thr.pending = -1; thr.hold = 128; threads_save(model, "threads", thr.base0, adopted); }
+    else if (cand_best >= 0) { thr.pending = cand_best; thr.hold = 128; }   // second cycle soon
+    else { thr.pending = -1; thr.hold_len = noisy ? 4096 : std::min(thr.hold_len*2, 65536); thr.hold = noisy ? 1024 : thr.hold_len; }
+    set(thr.base);
+    thr.cycles++;
+    thr.cand.clear();
 }
 
 void llama_context::set_n_threads(int32_t n_threads, int32_t n_threads_batch) {
@@ -1585,7 +2149,12 @@ void llama_context::set_causal_attn(bool value) {
 
     cparams.causal_attn = value;
 
-    sched_need_reserve = true;
+    // no scheduler reserve needed because graph shapes must not depend on causal_attn, a flip only rebuilds the graph
+    //sched_need_reserve = true;
+}
+
+bool llama_context::get_causal_attn() const {
+    return cparams.causal_attn;
 }
 
 void llama_context::set_warmup(bool value) {
@@ -1733,7 +2302,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     bool graph_sequence_layout_changed = false;
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams) && llama_moe_cache_graph_reusable()) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1772,11 +2341,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        set_eval_cb();
 
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+        llama_moe_cache_graph_built();
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1828,24 +2398,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     return res;
 }
 
-int llama_context::encode(const llama_batch & batch_inp) {
-    // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
-    // so accept either present rather than requiring exactly one.
-    GGML_ASSERT(batch_inp.token || batch_inp.embd);
-
-    if (batch_inp.n_tokens == 0) {
+int llama_context::encode(const llama_batch_ext & batch_inp) {
+    if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
 
     const auto & hparams = model.hparams;
 
+    if (batch_inp.n_embd > 0 && batch_inp.n_embd != hparams.n_embd_inp_enc()) {
+        LLAMA_LOG_ERROR("%s: embd row width %zu does not match the encoder input %u\n",
+                __func__, batch_inp.n_embd, hparams.n_embd_inp_enc());
+        return -1;
+    }
+
     // eagle3/DFlash: features as encoder input, and non-draft paths fall back to model's input dim
-    const int64_t n_embd = hparams.n_embd_inp_enc();
     const int64_t n_vocab = model.vocab.n_tokens();
 
-    // note: during encode, we always pass the full sequence starting from pos = 0
-    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+    // note: during encode, we always output all tokens and skip position continuity checks (output_all=true)
+    if (!balloc->init(batch_inp, model.vocab, true)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -2066,18 +2637,32 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
-int llama_context::decode(const llama_batch & batch_inp) {
-    // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
-    // so accept either present rather than requiring exactly one.
-    GGML_ASSERT(batch_inp.token || batch_inp.embd);
-
+int llama_context::decode(const llama_batch_ext & batch_inp) {
+    moe_decoded = true;
+    if (!cparams.moe_cache && !moe_observe_started && !moe_cache_defer) {
+        moe_observe_started = true;
+        llama_moe_observe_start(model);
+    }
+    if (cparams.moe_cache && !cparams.moe_cache_started && !moe_cache_defer) {
+        cparams.moe_cache_started = true;
+        llama_moe_cache_init(model, cparams.moe_cache_slots, cparams.moe_cache_inserts, cparams.prefetch_experts_slots, cparams.moe_cache_window,
+                cparams.moe_predict, cparams.moe_predict_train);
+        thread_cap_from_probe(llama_moe_cache_cpu_sat_threads());
+        sched_reserve(); // the compute graph now includes the cache chain
+    }
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
     }
 
-    if (batch_inp.n_tokens == 0) {
+    if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
+        return -1;
+    }
+
+    if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
+        LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
+                __func__, batch_inp.n_embd, batch_inp.n_embd_inp);
         return -1;
     }
 
@@ -2085,10 +2670,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
-    const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
-    // DFlash embd batches carry the fused target features at the encoder input width
-    const bool    dflash_embd = model.arch == LLM_ARCH_DFLASH && batch_inp.embd;
-    const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : dflash_embd ? hparams.n_embd_inp_enc() : hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
@@ -2096,20 +2677,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
 
-    // embedding contexts output every token even when batch.logits is not set
-    if (has_samplers && (output_all || batch_inp.logits)) {
+    // TODO: avoid this workaround in the future
+    // embedding contexts output every token even when no token is explicitly marked as output
+    if (has_samplers) {
         std::vector<int32_t> seq_output_count(n_seq_max, 0);
 
-        for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
-            if (!output_all && batch_inp.logits[i] == 0) {
+        for (const auto & tok : batch_inp.tokens) {
+            if (!output_all && !tok.output) {
                 continue;
             }
 
-            const int ns = batch_inp.n_seq_id ? batch_inp.n_seq_id[i] : 1;
-
-            for (int32_t s = 0; s < ns; ++s) {
-                const llama_seq_id seq_id = batch_inp.seq_id ? batch_inp.seq_id[i][s] : 0;
-
+            for (auto seq_id : tok.seq_ids) {
                 if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
                     continue;
                 }
@@ -2127,7 +2705,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+    if (!balloc->init(batch_inp, vocab, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -2161,6 +2739,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
     n_queued_tokens += n_tokens_all;
 
     output_swaps.clear();
+    embd_batch_idxs.clear();
+
+    if (!mtp_dsa_sel_raw.empty()) {
+        synchronize();
+    }
+    mtp_dsa_sel_raw.clear();
+    mtp_dsa_sel_mask.clear();
+    mtp_dsa_sel_seq.clear();
+    mtp_dsa_sel.clear();
+    mtp_dsa_sel_width = 0;
 
     sched_reserve();
 
@@ -2248,6 +2836,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         ggml_status status;
+
+        if (thrb.on) {
+            // batch thread tuner: the time from the start of the previous prompt ubatch to the start of this one is the previous one's cost
+            // (prompt-only batches are not synchronized one by one, so the compute time itself is not observable here)
+            const int64_t now = ggml_time_us();
+            if (thrb.last_tokens >= 64 && now - thrb.last_us < 20*1000*1000) {
+                thread_tune_feed_batch(now - thrb.last_us, thrb.last_tokens);
+            }
+            thrb.last_us = now;
+            thrb.last_tokens = ubatch.n_tokens > 1 ? ubatch.n_tokens : 0;
+        }
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
@@ -2439,6 +3038,37 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        auto * t_mtp_sel  = res->get_mtp_dsa_sel();
+        auto * t_mtp_mask = res->get_mtp_dsa_mask();
+        if (t_mtp_sel != nullptr || t_mtp_mask != nullptr) {
+            GGML_ASSERT(t_mtp_sel != nullptr && t_mtp_mask != nullptr);
+            GGML_ASSERT(t_mtp_sel->type == GGML_TYPE_I32 && t_mtp_mask->type == GGML_TYPE_F32);
+            GGML_ASSERT(ggml_is_contiguous(t_mtp_sel) && ggml_is_contiguous(t_mtp_mask));
+            GGML_ASSERT(t_mtp_sel->ne[0] == t_mtp_mask->ne[0] && t_mtp_sel->ne[1] == (int64_t) ubatch.n_tokens);
+            GGML_ASSERT(ggml_nelements(t_mtp_sel) == ggml_nelements(t_mtp_mask));
+
+            const size_t width = (size_t) t_mtp_sel->ne[0];
+            if (mtp_dsa_sel_width == 0) {
+                mtp_dsa_sel_width = width;
+                mtp_dsa_sel_raw.resize(width*n_tokens_all);
+                mtp_dsa_sel_mask.resize(width*n_tokens_all);
+                mtp_dsa_sel_seq.resize(n_tokens_all, -1);
+            }
+            GGML_ASSERT(width == mtp_dsa_sel_width);
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                GGML_ASSERT(ubatch.n_seq_id[i] == 1);
+                mtp_dsa_sel_seq[(size_t) n_tokens_prev + i] = ubatch.seq_id[i][0];
+            }
+
+            const size_t offset = width*(size_t) n_tokens_prev;
+            ggml_backend_t backend_sel = ggml_backend_sched_get_tensor_backend(sched.get(), t_mtp_sel);
+            ggml_backend_t backend_mask = ggml_backend_sched_get_tensor_backend(sched.get(), t_mtp_mask);
+            GGML_ASSERT(backend_sel != nullptr && backend_mask != nullptr);
+            ggml_backend_tensor_get_async(backend_sel, t_mtp_sel, mtp_dsa_sel_raw.data() + offset, 0, ggml_nbytes(t_mtp_sel));
+            ggml_backend_tensor_get_async(backend_mask, t_mtp_mask, mtp_dsa_sel_mask.data() + offset, 0, ggml_nbytes(t_mtp_mask));
+        }
+
+
         if (has_samplers) {
             const auto stride = n_vocab;
 
@@ -2505,6 +3135,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    // apply throttled MoE expert-cache updates between graph executions; wait for
+    // the GPU first so no queued read of a slot races the worker refilling it
+    static const bool mc_sync = !moe_opt("sync") || atoi(moe_opt("sync")) != 0;
+    // only the context that owns the cache steps it (not e.g. an MTP draft context)
+    if (cparams.moe_cache) {
+        if (mc_sync && llama_moe_cache_active()) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
+        llama_moe_cache_step();
+    }
 
     return 0;
 }
@@ -2748,11 +3389,13 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         GGML_ASSERT(nfloats % n_tokens == 0);
 
         const size_t row_floats = nfloats / n_tokens;
+        GGML_ASSERT(row_floats == model.hparams.n_embd);
         const size_t dst_offset = token_offset * row_floats;
         GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
+        // Tensor-split backends require a zero source offset.
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
 
         const bool layer_accum_ok = accum_ok && layer_inp_accum_idx[il] >= 0 &&
@@ -2864,6 +3507,7 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
             ggml_backend_sched_synchronize(sched.get());
         }
     }
+    return extracted;
 }
 
 void llama_context::output_reorder() {
@@ -2887,19 +3531,9 @@ void llama_context::output_reorder() {
             }
         }
 
-        if (embd_nextn.size > 0) {
+        if (embd_nextn.size > 0 && cparams.embeddings_nextn_masked) {
             for (uint64_t k = 0; k < n_embd_out; k++) {
                 std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
-            }
-        }
-
-        if (embd_layer_inp.size() > 0) {
-            for (int lid = 0; lid < (int) embd_layer_inp.size(); ++lid) {
-                if (embd_layer_inp[lid].size > 0) {
-                    for (uint64_t k = 0; k < n_embd; ++k) {
-                        std::swap(embd_layer_inp[lid].data[i0*n_embd + k], embd_layer_inp[lid].data[i1*n_embd + k]);
-                    }
-                }
             }
         }
 
@@ -2932,6 +3566,29 @@ void llama_context::output_reorder() {
     }
 
     output_swaps.clear();
+
+    // [TAG_EXTRACT_TARGET_EMBEDDINGS]
+    // Layer inputs and unmasked NextN embeddings contain all token rows, independent of logits selection.
+    for (size_t i = 0; i < embd_batch_idxs.size(); ++i) {
+        while (embd_batch_idxs[i] != (int32_t) i) {
+            const int32_t j = embd_batch_idxs[i];
+            GGML_ASSERT(j >= 0 && (size_t) j < embd_batch_idxs.size());
+            if (embd_nextn.has_data() && !cparams.embeddings_nextn_masked) {
+                for (size_t k = 0; k < n_embd_out; ++k) {
+                    std::swap(embd_nextn.data[i*n_embd_out + k], embd_nextn.data[j*n_embd_out + k]);
+                }
+            }
+            for (auto & layer : embd_layer_inp) {
+                if (layer.has_data()) {
+                    for (size_t k = 0; k < n_embd; ++k) {
+                        std::swap(layer.data[i*n_embd + k], layer.data[j*n_embd + k]);
+                    }
+                }
+            }
+            std::swap(embd_batch_idxs[i], embd_batch_idxs[j]);
+        }
+    }
+    embd_batch_idxs.clear();
 }
 
 //
@@ -2940,7 +3597,7 @@ void llama_context::output_reorder() {
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     uint32_t res;
-    if (model.arch == LLM_ARCH_KIMI_K3) {
+    if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_GLM5_NEXT) {
         // the n_tokens*40 budget below is exhausted at ubatch 3840
         res = std::max<uint32_t>(n_tokens * 160, 64u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_HRM_TEXT) {
@@ -2951,6 +3608,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_BAILINGMOE3 ||
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
+        model.arch == LLM_ARCH_CLEF ||
         model.arch == LLM_ARCH_QWEN4EXP ||
         model.arch == LLM_ARCH_GIGACHAT35 ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
@@ -2985,10 +3643,23 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
             std::min(n_tokens, cparams.n_outputs_max),
             (uint64_t) cparams.n_seq_max * cparams.n_outputs_max_per_seq);
 
+    // MoE expert cache chain, per layer: slot lookup and CPU pinning, plus up/gate/
+    // activation/down/concat per 4-token chunk of batches up to max_batch. The
+    // scheduler is sized before the cache exists, so budget for it up front.
+    if (cparams.moe_cache) {
+        const uint32_t nt = (uint32_t) std::min<int64_t>(n_tokens, llama_moe_cache_max_batch());
+        res += model.hparams.n_layer() * (16u + 12u * ((nt + 3) / 4));
+    }
+
     res += n_sampling_nodes;
     if (n_sampling_outputs_max > 1) {
         res += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
     }
+
+    if (cparams.training) {
+        res *= 4;
+    }
+
     return res;
 }
 
@@ -3100,6 +3771,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * gf = model.build_graph(gparams);
 
+    this->n_input_tensors = llama_graph_n_input_tensors(gf);
     this->n_outputs = save_n_outputs;
 
     // initialize scheduler with the specified graph
@@ -3135,6 +3807,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3323,6 +3996,10 @@ public:
         ptr += size;
         size_read += size;
         buf_size -= size;
+    }
+
+    void discard() override {
+        rinfos.clear();
     }
 
     size_t n_bytes() override {
@@ -3675,6 +4352,11 @@ public:
         rinfos.push_back({tensor, ptr, size, offset});
     }
 
+    void discard() override {
+        rinfos.clear();
+        buf_size = 0;
+    }
+
     size_t n_bytes() override {
         return size_read;
     }
@@ -3721,6 +4403,7 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
         return state_read_data(io);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+        io.discard();
         return 0;
     }
 }
@@ -3794,6 +4477,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         return state_seq_read_data(*io, seq_id, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+        io->discard();
         return 0;
     }
 }
@@ -4076,11 +4760,18 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     if (cparams.flash_attn) {
         LLAMA_LOG_INFO("%s: disabling flash attention, FLASH_ATTN_EXT has no backward pass\n", __func__);
         cparams.flash_attn = false;
-
-        // the graph changes without flash attention, need to reserve again
-        sched_need_reserve = true;
-        sched_reserve();
     }
+
+    // gradients cannot flow through the KV cache, so the attention reads the K and V of the current ubatch directly
+    if (n_ubatch == cparams.n_ctx) {
+        cparams.training = true;
+    } else {
+        LLAMA_LOG_WARN("%s: n_ubatch (%u) != n_ctx (%u), the K and V projections will not receive gradients\n", __func__, n_ubatch, cparams.n_ctx);
+    }
+
+    // the training graph is different, need to reserve again
+    sched_need_reserve = true;
+    sched_reserve();
 
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
     opt_params.opt_period      = n_batch / n_ubatch;
@@ -4143,9 +4834,13 @@ void llama_context::opt_epoch_iter(
             batch.logits  [pos_batch]    = true;
         }
 
-        if (!balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(), cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
-            LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
-            return;
+        // TODO: use llama_batch_ext here
+        {
+            llama_batch_compat compat(this, batch);
+            if (!balloc->init(*compat.batch_ext, model.vocab, true)) {
+                LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+                return;
+            }
         }
 
         const uint32_t n_tokens_all = balloc->get_n_tokens();
@@ -4302,6 +4997,11 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
+        /*.n_moe_cache_slots           =*/ 0,
+        /*.n_moe_cache_inserts         =*/ 2,
+        /*.n_moe_cache_window          =*/ 64,
+        /*.n_moe_predict               =*/ 0,
+        /*.n_moe_predict_train         =*/ 0,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
@@ -4314,6 +5014,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.prefetch_experts_slots      =*/ 0,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -4483,6 +5184,14 @@ void llama_detach_threadpool(llama_context * ctx) {
     ctx->detach_threadpool();
 }
 
+void llama_set_thread_autotune(llama_context * ctx, bool on) {
+    ctx->set_thread_autotune(on);
+}
+
+void llama_set_batch_thread_autotune(llama_context * ctx, bool on, int32_t n_max) {
+    ctx->set_batch_thread_autotune(on, n_max);
+}
+
 void llama_set_n_threads(llama_context * ctx, int32_t n_threads, int32_t n_threads_batch) {
     ctx->set_n_threads(n_threads, n_threads_batch);
 }
@@ -4507,8 +5216,16 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
 }
 
+bool llama_get_causal_attn(const llama_context * ctx) {
+    return ctx->get_causal_attn();
+}
+
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
+}
+
+void llama_moe_cache_defer(llama_context * ctx, bool defer) {
+    ctx->moe_cache_defer = defer;
 }
 
 void llama_synchronize(llama_context * ctx) {
@@ -4633,6 +5350,25 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn_ith(i);
+}
+
+bool llama_set_mtp_dsa_index_share(llama_context * ctx, bool enabled) {
+    return ctx != nullptr && ctx->set_mtp_dsa_index_share(enabled);
+}
+
+bool llama_set_mtp_dsa_selection(llama_context * ctx, const int32_t * data, size_t size) {
+    return ctx != nullptr && ctx->set_mtp_dsa_selection(data, size);
+}
+
+const int32_t * llama_get_mtp_dsa_selection(llama_context * ctx, size_t * size) {
+    if (ctx == nullptr) {
+        if (size != nullptr) {
+            *size = 0;
+        }
+        return nullptr;
+    }
+    ctx->synchronize();
+    return ctx->get_mtp_dsa_selection(size);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
@@ -4946,6 +5682,18 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
     }
 }
 
+// compat: llama_batch -> llama_batch_ext -> encode/decode
+
+int llama_context::encode(const llama_batch & batch_inp) {
+    llama_batch_compat compat(this, batch_inp, model.hparams.n_embd_inp_enc());
+    return encode(*compat.batch_ext);
+}
+
+int llama_context::decode(const llama_batch & batch_inp) {
+    llama_batch_compat compat(this, batch_inp);
+    return decode(*compat.batch_ext);
+}
+
 ///
 
 int32_t llama_encode(
@@ -4986,6 +5734,8 @@ llama_perf_context_data llama_perf_context(const llama_context * ctx) {
     return data;
 }
 
+static void llama_log_tuning(const char * fn, const llama_context * ctx);
+
 void llama_perf_context_print(const llama_context * ctx) {
     const auto data = llama_perf_context(ctx);
 
@@ -4998,6 +5748,34 @@ void llama_perf_context_print(const llama_context * ctx) {
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+    llama_log_tuning(__func__, ctx);
+}
+
+void llama_get_tuning_info(const llama_context * ctx, llama_tuning_info * info) {
+    *info = {};
+    info->margin = info->gate = info->wait = info->big = info->predict = info->self_tune = -1;
+    info->moe_slots_min = info->moe_slots_max = info->moe_layers = -1;
+    info->moe_active = llama_moe_cache_get_info(info);
+    info->n_threads       = (int32_t) ctx->get_cparams().n_threads;
+    info->n_threads_batch = (int32_t) ctx->get_cparams().n_threads_batch;
+    info->n_batch         = (int32_t) ctx->n_batch();
+    info->n_ubatch        = (int32_t) ctx->n_ubatch();
+}
+
+static void llama_log_tuning(const char * fn, const llama_context * ctx) {
+    llama_tuning_info t;
+    llama_get_tuning_info(ctx, &t);
+    if (t.moe_active) {
+        const uint64_t n = t.moe_hits + t.moe_misses;
+        LLAMA_LOG_INFO("%s:    moe cache = on, hit %.1f%% (%llu/%llu experts), %d layers, %d..%d slots/layer, %llu uploads\n", fn,
+                n ? 100.0*t.moe_hits/n : 0.0, (unsigned long long) t.moe_hits, (unsigned long long) n, t.moe_layers, t.moe_slots_min,
+                t.moe_slots_max, (unsigned long long) t.moe_uploads);
+        LLAMA_LOG_INFO("%s:    tuned     = margin %d, gate %d, wait %d, big %d, predict %d, self-tune %s\n", fn, t.margin, t.gate, t.wait, t.big,
+                t.predict, t.self_tune ? "on" : "off");
+    } else {
+        LLAMA_LOG_INFO("%s:    moe cache = off\n", fn);
+    }
+    LLAMA_LOG_INFO("%s:    threads   = %d decode / %d batch, batch %d, ubatch %d\n", fn, t.n_threads, t.n_threads_batch, t.n_batch, t.n_ubatch);
 }
 
 void llama_perf_context_reset(llama_context * ctx) {
@@ -5033,6 +5811,14 @@ void llama_opt_epoch(
         idata_split,
         callback_train,
         callback_eval);
+}
+
+int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_ext * batch) {
+    switch (type) {
+        case LLAMA_PROCESS_TYPE_ENCODE: return ctx->encode(*batch);
+        case LLAMA_PROCESS_TYPE_DECODE: return ctx->decode(*batch);
+    }
+    return -1;
 }
 
 //
