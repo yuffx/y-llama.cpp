@@ -1216,12 +1216,6 @@ struct llama_model_deepseek4 : public llama_model_base {
         // mix_in is the mix to collapse x with.
         // V4 leaves it null and uses the one computed here; V4.1 shifts the coefficients by one sublayer and passes the carried mix.
 
-        // collapse the hc streams with per-stream weights
-        ggml_tensor * build_hc_pre(
-                ggml_tensor * x,
-                ggml_tensor * weights,
-                int il) const;
-
         // mean over the hyper-connection streams: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
         ggml_tensor * build_hc_mean(ggml_tensor * x) const;
 
@@ -1250,10 +1244,6 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * x,
                 ggml_tensor * residual,
                 ggml_tensor * post,
-                ggml_tensor * comb,
-                int il) const;
-
-        ggml_tensor * build_hc_sinkhorn(
                 ggml_tensor * comb,
                 int il) const;
 

@@ -284,6 +284,7 @@ public:
     // and shared across layers which use build_rs
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
+    ggml_tensor * s_copy_extra = nullptr; // I32 [n_rs - n_seqs]
 
     // Ring-mode physical destination rows, ordered j + n_seqs*s.
     // Per-snapshot leaves are first-class inputs because views do not inherit the scheduler's staged-input contract.

@@ -2721,39 +2721,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             up = build_lora_mm_id(up_exps, cur, ids_x, up_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(up, "ffn_moe_up", il);
 
-        if (gate_exps_s) {
-            cb(cur, "ffn_moe_gate_scaled", il);
-        }
-
-        if (gate_exps_b) {
-            cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
-            cb(cur, "ffn_moe_gate_biased", il);
-        }
-    }
-
-    const bool has_gate = gate_exps || gate_up_exps;
-
-    switch (type_op) {
-        case LLM_FFN_SILU:
-            if (gate_exps) {
-                if (il >= 0) {
-                    const float limit = hparams.swiglu_clamp_exp[il];
-                    constexpr float eps = 1e-6f;
-                    if (limit > eps) {
-                        if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || arch == LLM_ARCH_GIGACHAT35 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4) {
-                            cur = ggml_swiglu_clamp(ctx0, cur, up, limit);
-                        } else {
-                            up = ggml_clamp(ctx0, up, -limit, limit);
-                            cb(up, "ffn_moe_up_clamped", il);
-                            ggml_tensor * gate_act = ggml_silu(ctx0, cur);
-                            cb(gate_act, "ffn_moe_silu", il);
-                            gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
-                            cb(gate_act, "ffn_moe_silu_clamped", il);
-                            cur = ggml_mul(ctx0, gate_act, up);
-                        }
-                        cb(cur, "ffn_moe_swiglu_limited", il);
-                        break;
-                    }
+            if (mcache) {
+                up->src[3] = mcache->host_table;
+                up->op_params[0] = mcache->n_slots;
+                if (mc_cpu_backend) {
+                    // must run where the skip table is honored (CPU), never op-offloaded
+                    ggml_backend_sched_set_tensor_backend(sched, up, mc_cpu_backend);
                 }
             }
 
@@ -4450,6 +4423,8 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->s_copy_main = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
     ggml_set_name(inp->s_copy_main, "s_copy_main");
     ggml_set_input(inp->s_copy_main);
+
+    inp->s_copy_tail = ggml_view_1d(ctx0, inp->s_copy, n_rs - 1, inp->s_copy->nb[0]);
 
     if (n_rs > n_seqs) {
         inp->s_copy_extra = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs - n_seqs);

@@ -3509,7 +3509,6 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
             ggml_backend_sched_synchronize(sched.get());
         }
     }
-    return extracted;
 }
 
 void llama_context::output_reorder() {
