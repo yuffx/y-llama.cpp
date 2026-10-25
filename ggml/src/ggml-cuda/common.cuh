@@ -44,6 +44,27 @@
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
 
 #define WARP_SIZE 32
+#if defined(GGML_USE_HIP)
+#define GGML_BALLOT_MASK 0xffffffffffffffffULL
+#else
+#define GGML_BALLOT_MASK 0xffffffffu
+#endif
+
+// HIP's __shfl_*_sync macros require an explicit width; CUDA allows omitting it.
+// Accept both 3- and 4-argument forms.
+#if defined(GGML_USE_HIP)
+#define GGML_SHFL_XOR_PICK(_1,_2,_3,_4,NAME,...) NAME
+#define GGML_SHFL_XOR3(mask, var, lane)        __shfl_xor(var, lane, 32)
+#define GGML_SHFL_XOR4(mask, var, lane, width) __shfl_xor(var, lane, width)
+#undef  __shfl_xor_sync
+#define __shfl_xor_sync(...) GGML_SHFL_XOR_PICK(__VA_ARGS__, GGML_SHFL_XOR4, GGML_SHFL_XOR3)(__VA_ARGS__)
+
+#define GGML_SHFL_PICK(_1,_2,_3,_4,NAME,...) NAME
+#define GGML_SHFL3(mask, var, srcLane)        __shfl(var, srcLane, 32)
+#define GGML_SHFL4(mask, var, srcLane, width) __shfl(var, srcLane, width)
+#undef  __shfl_sync
+#define __shfl_sync(...) GGML_SHFL_PICK(__VA_ARGS__, GGML_SHFL4, GGML_SHFL3)(__VA_ARGS__)
+#endif
 #define CUDART_HMAX   11070 // CUDA 11.7, min. ver. for which __hmax and __hmax2 are known to work (may be higher than needed)
 #define CUDART_HMASK  12000 // CUDA 12.0, min. ver. for half2 -> uint mask comparisons
 

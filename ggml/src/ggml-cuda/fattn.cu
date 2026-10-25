@@ -49,7 +49,7 @@ static __global__ void flash_attn_mask_to_sparse_indices(
                     selected |= (!oob || q < q1 - q0) && isfinite(__half2float(mask[q*s31 + i]));
                 }
             }
-            selected_warp[item] = __ballot_sync(0xFFFFFFFF, selected);
+            selected_warp[item] = __ballot_sync(GGML_BALLOT_MASK, selected);
             warp_count += __popc(selected_warp[item]);
         }
 
@@ -410,6 +410,17 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512,  4>(ctx, dst);
             }
         } break;
+        case 640: {
+            // Padded turbo KV cache for GLM-4.7 Flash (K head_dim=576 zero-padded to 640).
+            // D=640 shared memory (Q storage = ncols*(DKQ/2+4)*4) exceeds hardware limit at ncols1>=4.
+            // Cap at ncols1=2 (ncols=32): Q=32*324*4=41KB + KV≈37KB = ~78KB total.
+            GGML_ASSERT(V->ne[0] == 512);
+            if (Q->ne[1] <= 1) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<640, 512, 1, 16>(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_f16_case<640, 512, 2, 16>(ctx, dst);
+            }
+        } break;
         default:
             GGML_ABORT("fatal error");
     }
@@ -426,6 +437,18 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     FATTN_VEC_CASE( 64, type_K_case, type_V_case)       \
     FATTN_VEC_CASE(128, type_K_case, type_V_case)       \
     FATTN_VEC_CASE(256, type_K_case, type_V_case)       \
+
+// TurboQuant combos are always compiled (see ggml/src/ggml-cuda/CMakeLists.txt), so they
+// bypass the GGML_CUDA_FA_<K>_<V> compile-time selection macros.
+#define FATTN_VEC_CASE_TQ(D, type_K_case, type_V_case)                                                                 \
+    if (head_size == (D) && type_K == GGML_TYPE_##type_K_case && type_V == GGML_TYPE_##type_V_case) {                   \
+        return ggml_cuda_flash_attn_ext_vec_case<D, GGML_TYPE_##type_K_case, GGML_TYPE_##type_V_case>;                  \
+    }
+
+#define FATTN_VEC_CASES_ALL_D_TQ(type_K_case, type_V_case) \
+    FATTN_VEC_CASE_TQ( 64, type_K_case, type_V_case)       \
+    FATTN_VEC_CASE_TQ(128, type_K_case, type_V_case)       \
+    FATTN_VEC_CASE_TQ(256, type_K_case, type_V_case)       \
 
 typedef void (* fattn_vec_case_t)(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
@@ -489,6 +512,32 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q8_0, BF16)
     FATTN_VEC_CASES_ALL_D(BF16, BF16)
 
+    // TurboQuant KV cache types (fork): dedicated VEC kernel instances
+    // turbo3
+    FATTN_VEC_CASES_ALL_D_TQ(TURBO3_0, TURBO3_0)
+    FATTN_VEC_CASES_ALL_D_TQ(TURBO3_0, Q8_0)
+    FATTN_VEC_CASES_ALL_D_TQ(Q8_0,     TURBO3_0)
+    FATTN_VEC_CASES_ALL_D_TQ(F16,      TURBO3_0)
+    FATTN_VEC_CASES_ALL_D_TQ(TURBO3_0, F16)
+    // turbo2
+    FATTN_VEC_CASES_ALL_D_TQ(TURBO2_0, TURBO2_0)
+    FATTN_VEC_CASES_ALL_D_TQ(TURBO2_0, Q8_0)
+    FATTN_VEC_CASES_ALL_D_TQ(Q8_0,     TURBO2_0)
+    FATTN_VEC_CASES_ALL_D_TQ(F16,      TURBO2_0)
+    FATTN_VEC_CASES_ALL_D_TQ(TURBO2_0, F16)
+    FATTN_VEC_CASES_ALL_D_TQ(TURBO3_0, TURBO2_0)
+    FATTN_VEC_CASES_ALL_D_TQ(TURBO2_0, TURBO3_0)
+    // turbo4
+    FATTN_VEC_CASES_ALL_D_TQ(TURBO4_0, TURBO4_0)
+    FATTN_VEC_CASES_ALL_D_TQ(TURBO4_0, Q8_0)
+    FATTN_VEC_CASES_ALL_D_TQ(Q8_0,     TURBO4_0)
+    FATTN_VEC_CASES_ALL_D_TQ(F16,      TURBO4_0)
+    FATTN_VEC_CASES_ALL_D_TQ(TURBO4_0, F16)
+    FATTN_VEC_CASES_ALL_D_TQ(TURBO4_0, TURBO3_0)
+    FATTN_VEC_CASES_ALL_D_TQ(TURBO3_0, TURBO4_0)
+    FATTN_VEC_CASES_ALL_D_TQ(TURBO4_0, TURBO2_0)
+    FATTN_VEC_CASES_ALL_D_TQ(TURBO2_0, TURBO4_0)
+
     return nullptr;
 }
 
@@ -531,6 +580,11 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
+            return true;
+        // TurboQuant KV cache types (fork): dedicated VEC kernel instances
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
             return true;
         default:
             return false;
@@ -621,7 +675,30 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_NONE;
     }
 
+#ifndef GGML_CUDA_FA_ALL_QUANTS
+    if (K->type != V->type) {
+        // Allow mixed KV types for combinations that have FA template instances compiled in:
+        // - turbo2/3/4 + q8_0 (turbo cache work)
+        // - f16/bf16 + q8_0 (common K=f16, V=q8_0 setup)
+        auto is_kv_compat = [](ggml_type t) {
+            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0
+                || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16;
+        };
+        if (!is_kv_compat(K->type) || !is_kv_compat(V->type)) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+    }
+#endif // GGML_CUDA_FA_ALL_QUANTS
+
     if (!ggml_cuda_fattn_kv_type_supported(K->type) || !ggml_cuda_fattn_kv_type_supported(V->type)) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
+    // TurboQuant KV cache types: VEC kernels are instantiated for D in {64, 128, 256} only.
+    const auto is_turbo_kv = [](ggml_type t) {
+        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+    };
+    if ((is_turbo_kv(K->type) || is_turbo_kv(V->type)) && K->ne[0] % 64 != 0) {
         return BEST_FATTN_KERNEL_NONE;
     }
 

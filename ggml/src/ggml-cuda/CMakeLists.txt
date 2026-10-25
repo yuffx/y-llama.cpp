@@ -126,6 +126,31 @@ if (CUDAToolkit_FOUND)
 
     ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+    # TurboQuant KV-cache FA instances (fork), not covered by ggml_cuda_fattn_vec_instances()
+    if (NOT GGML_CUDA_FA_ALL_QUANTS)
+        list(APPEND GGML_SOURCES_CUDA
+        template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
+        template-instances/fattn-vec-instance-turbo3_0-q8_0.cu
+        template-instances/fattn-vec-instance-q8_0-turbo3_0.cu
+        template-instances/fattn-vec-instance-f16-turbo3_0.cu
+        template-instances/fattn-vec-instance-turbo3_0-f16.cu
+        template-instances/fattn-vec-instance-turbo2_0-turbo2_0.cu
+        template-instances/fattn-vec-instance-turbo2_0-q8_0.cu
+        template-instances/fattn-vec-instance-q8_0-turbo2_0.cu
+        template-instances/fattn-vec-instance-f16-turbo2_0.cu
+        template-instances/fattn-vec-instance-turbo2_0-f16.cu
+        template-instances/fattn-vec-instance-turbo3_0-turbo2_0.cu
+        template-instances/fattn-vec-instance-turbo2_0-turbo3_0.cu
+        template-instances/fattn-vec-instance-turbo4_0-turbo4_0.cu
+        template-instances/fattn-vec-instance-turbo4_0-q8_0.cu
+        template-instances/fattn-vec-instance-q8_0-turbo4_0.cu
+        template-instances/fattn-vec-instance-f16-turbo4_0.cu
+        template-instances/fattn-vec-instance-turbo4_0-f16.cu
+        template-instances/fattn-vec-instance-turbo4_0-turbo3_0.cu
+        template-instances/fattn-vec-instance-turbo3_0-turbo4_0.cu
+        template-instances/fattn-vec-instance-turbo4_0-turbo2_0.cu
+        template-instances/fattn-vec-instance-turbo2_0-turbo4_0.cu)
+    endif()
 
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
