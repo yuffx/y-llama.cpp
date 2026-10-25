@@ -55,51 +55,18 @@ void llama_model_gigachat35::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_gigachat35::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
-    const bool mtp_only = (n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
-    const std::string mtp_probe = "blk." + std::to_string(n_layer) + ".nextn.eh_proj.weight";
-    const bool trunk_only = (n_layer_nextn > 0) && (ml.get_weight(mtp_probe.c_str()) == nullptr);
-    const int trunk_flags = mtp_only  ? TENSOR_NOT_REQUIRED : 0;
-    const int mtp_flags   = trunk_only ? TENSOR_NOT_REQUIRED : 0;
+    const auto nf = nextn_flags(ml);
+    const int trunk_flags = nf.trunk;
+    const int mtp_flags   = nf.mtp;
 
-    auto create_tensor_from_meta = [&](const LLM_TN_IMPL & tname, int flags) -> ggml_tensor * {
-        const ggml_tensor * meta = ml.get_tensor_meta(tname.str().c_str());
-        if (meta == nullptr && ml.files.empty()) {
-            const int64_t id = gguf_find_tensor(ml.metadata, tname.str().c_str());
-            if (id >= 0) {
-                const int64_t * ne = gguf_get_tensor_ne(ml.metadata, id);
-                return create_tensor(tname, { ne[0], ne[1], ne[2], ne[3] }, flags);
-            }
-        }
-        if (meta == nullptr) {
-            if (flags & TENSOR_NOT_REQUIRED) {
-                return nullptr;
-            }
-            throw std::runtime_error("missing tensor '" + tname.str() + "'");
-        }
-
-        switch (ggml_n_dims(meta)) {
-            case 1: return create_tensor(tname, { meta->ne[0] }, flags);
-            case 2: return create_tensor(tname, { meta->ne[0], meta->ne[1] }, flags);
-            case 3: return create_tensor(tname, { meta->ne[0], meta->ne[1], meta->ne[2] }, flags);
-            case 4: return create_tensor(tname, { meta->ne[0], meta->ne[1], meta->ne[2], meta->ne[3] }, flags);
-            default:
-                throw std::runtime_error("GigaChat35: unsupported tensor rank for " + tname.str());
-        }
-    };
-
-    auto load_norm = [&](ggml_tensor * & norm, ggml_tensor * & gate_up, ggml_tensor * & gate_down,
-            llm_tensor norm_id, llm_tensor gate_up_id, llm_tensor gate_down_id, int il, int64_t dim, int flags) {
-        norm      = create_tensor(tn(norm_id,      "weight", il), { dim }, flags);
-        gate_up   = create_tensor_from_meta(tn(gate_up_id,   "weight", il), flags);
-        gate_down = create_tensor_from_meta(tn(gate_down_id, "weight", il), flags);
-    };
+    const int64_t norm_gate_rank = 16;
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
-    output_norm           = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
-    output_norm_gate_up   = create_tensor_from_meta(tn(LLM_TENSOR_OUTPUT_NORM_GATE_UP,   "weight"), 0);
-    output_norm_gate_down = create_tensor_from_meta(tn(LLM_TENSOR_OUTPUT_NORM_GATE_DOWN, "weight"), 0);
-    output                = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, trunk_flags);
+    output_norm           = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,           "weight"), { n_embd }, 0);
+    output_norm_gate_up    = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM_GATE_UP,   "weight"), { n_embd, norm_gate_rank }, 0);
+    output_norm_gate_down  = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM_GATE_DOWN, "weight"), { norm_gate_rank, n_embd }, 0);
+    output                = create_tensor(tn(LLM_TENSOR_OUTPUT,                "weight"), { n_embd, n_vocab }, trunk_flags);
     if (output == nullptr) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
@@ -127,119 +94,89 @@ void llama_model_gigachat35::load_arch_tensors(llama_model_loader & ml) {
     const int64_t value_dim  = head_v_dim * n_v_heads;
     const int64_t conv_dim   = 2 * key_dim + value_dim;
 
-    auto load_common_norms = [&](int il, int flags) {
+    for (int il = 0; il < n_layer_all; ++il) {
         auto & layer = layers[il];
-        load_norm(layer.attn_norm, layer.attn_norm_gate_up, layer.attn_norm_gate_down,
-                LLM_TENSOR_ATTN_NORM, LLM_TENSOR_ATTN_NORM_GATE_UP, LLM_TENSOR_ATTN_NORM_GATE_DOWN,
-                il, n_embd, flags);
-        load_norm(layer.attn_post_norm, layer.attn_post_norm_gate_up, layer.attn_post_norm_gate_down,
-                LLM_TENSOR_ATTN_POST_NORM, LLM_TENSOR_ATTN_POST_NORM_GATE_UP, LLM_TENSOR_ATTN_POST_NORM_GATE_DOWN,
-                il, n_embd, flags);
-        load_norm(layer.ffn_norm, layer.ffn_norm_gate_up, layer.ffn_norm_gate_down,
-                LLM_TENSOR_FFN_NORM, LLM_TENSOR_FFN_NORM_GATE_UP, LLM_TENSOR_FFN_NORM_GATE_DOWN,
-                il, n_embd, flags);
-        load_norm(layer.ffn_post_norm, layer.ffn_post_norm_gate_up, layer.ffn_post_norm_gate_down,
-                LLM_TENSOR_FFN_POST_NORM, LLM_TENSOR_FFN_POST_NORM_GATE_UP, LLM_TENSOR_FFN_POST_NORM_GATE_DOWN,
-                il, n_embd, flags);
-    };
-
-    auto load_mla_attention = [&](int il, int flags) {
-        auto & layer = layers[il];
+        const bool is_mtp = il >= n_layer;
+        const int flags = is_mtp ? mtp_flags : trunk_flags;
         const int64_t n_head_l = hparams.n_head(il);
 
-        if (q_lora_rank > 0) {
-            layer.wq_a = create_tensor(tn(LLM_TENSOR_ATTN_Q_A, "weight", il), { n_embd, q_lora_rank }, flags);
-            load_norm(layer.attn_q_a_norm, layer.attn_q_a_norm_gate_up, layer.attn_q_a_norm_gate_down,
-                    LLM_TENSOR_ATTN_Q_A_NORM, LLM_TENSOR_ATTN_Q_A_NORM_GATE_UP, LLM_TENSOR_ATTN_Q_A_NORM_GATE_DOWN,
-                    il, q_lora_rank, flags);
-            layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q_B, "weight", il), { q_lora_rank, n_head_l * n_embd_head_k_mla }, flags);
-        } else {
-            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", il), { n_embd, n_head_l * n_embd_head_k_mla }, flags);
-        }
+        layer.attn_norm           = create_tensor(tn(LLM_TENSOR_ATTN_NORM,           "weight", il), { n_embd }, flags);
+        layer.attn_norm_gate_up   = create_tensor(tn(LLM_TENSOR_ATTN_NORM_GATE_UP,   "weight", il), { n_embd, norm_gate_rank }, flags);
+        layer.attn_norm_gate_down = create_tensor(tn(LLM_TENSOR_ATTN_NORM_GATE_DOWN, "weight", il), { norm_gate_rank, n_embd }, flags);
 
-        layer.wkv_a_mqa = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_MQA, "weight", il), { n_embd, kv_lora_rank + n_embd_head_qk_rope }, flags);
-        load_norm(layer.attn_kv_a_norm, layer.attn_kv_a_norm_gate_up, layer.attn_kv_a_norm_gate_down,
-                LLM_TENSOR_ATTN_KV_A_NORM, LLM_TENSOR_ATTN_KV_A_NORM_GATE_UP, LLM_TENSOR_ATTN_KV_A_NORM_GATE_DOWN,
-                il, kv_lora_rank, flags);
-        layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K_B, "weight", il), { n_embd_head_qk_nope, kv_lora_rank, n_head_l }, flags);
-        layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V_B, "weight", il), { kv_lora_rank, n_embd_head_v_mla, n_head_l }, flags);
-        layer.wo   = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { n_head_l * n_embd_head_v_mla, n_embd }, flags);
+        layer.attn_post_norm           = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM,           "weight", il), { n_embd }, flags);
+        layer.attn_post_norm_gate_up   = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM_GATE_UP,   "weight", il), { n_embd, norm_gate_rank }, flags);
+        layer.attn_post_norm_gate_down = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM_GATE_DOWN, "weight", il), { norm_gate_rank, n_embd }, flags);
 
-        layer.wqkv_gate = create_tensor_from_meta(tn(LLM_TENSOR_ATTN_GATE, "weight", il), flags);
-    };
+        layer.ffn_norm           = create_tensor(tn(LLM_TENSOR_FFN_NORM,           "weight", il), { n_embd }, flags);
+        layer.ffn_norm_gate_up   = create_tensor(tn(LLM_TENSOR_FFN_NORM_GATE_UP,   "weight", il), { n_embd, norm_gate_rank }, flags);
+        layer.ffn_norm_gate_down = create_tensor(tn(LLM_TENSOR_FFN_NORM_GATE_DOWN, "weight", il), { norm_gate_rank, n_embd }, flags);
 
-    auto load_linear_attention = [&](int il, int flags) {
-        auto & layer = layers[il];
-        layer.wqkv       = create_tensor(tn(LLM_TENSOR_ATTN_QKV,   "weight", il), { n_embd, conv_dim }, flags);
-        layer.wqkv_gate  = create_tensor(tn(LLM_TENSOR_ATTN_GATE,  "weight", il), { n_embd, value_dim }, flags);
-        layer.ssm_conv1d = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "weight", il), { hparams.ssm_d_conv, conv_dim }, flags);
-        layer.ssm_dt     = create_tensor(tn(LLM_TENSOR_SSM_DT,     "bias",   il), { hparams.ssm_dt_rank }, flags);
-        layer.ssm_a      = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,         il), { hparams.ssm_dt_rank }, flags);
-        layer.ssm_beta   = create_tensor(tn(LLM_TENSOR_SSM_BETA,   "weight", il), { n_embd, n_v_heads }, flags);
-        layer.ssm_alpha  = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,  "weight", il), { n_embd, n_v_heads }, flags);
-        layer.ssm_norm   = create_tensor(tn(LLM_TENSOR_SSM_NORM,   "weight", il), { head_v_dim }, flags);
-        layer.ssm_out    = create_tensor(tn(LLM_TENSOR_SSM_OUT,    "weight", il), { value_dim, n_embd }, flags);
-    };
-
-    auto load_dense_ffn = [&](int il, int flags) {
-        auto & layer = layers[il];
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), { n_embd, n_ff }, flags);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), { n_embd, n_ff }, flags);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), { n_ff,   n_embd }, flags);
-    };
-
-    auto load_moe_ffn = [&](int il, int flags) {
-        auto & layer = layers[il];
-        layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", il), { n_embd, n_expert }, flags);
-        layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   il), { n_expert }, flags);
-        layer.ffn_down_exps   = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,   "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
-
-        layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", il), { n_embd,    n_ff_shexp }, flags);
-        layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", il), { n_embd,    n_ff_shexp }, flags);
-        layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", il), { n_ff_shexp, n_embd }, flags);
-    };
-
-    auto load_block = [&](int il, int flags, bool is_mtp) {
-        load_common_norms(il, flags);
+        layer.ffn_post_norm           = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM,           "weight", il), { n_embd }, flags);
+        layer.ffn_post_norm_gate_up   = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM_GATE_UP,   "weight", il), { n_embd, norm_gate_rank }, flags);
+        layer.ffn_post_norm_gate_down = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM_GATE_DOWN, "weight", il), { norm_gate_rank, n_embd }, flags);
 
         if (is_mtp || !hparams.is_recr(il)) {
-            load_mla_attention(il, flags);
+            if (q_lora_rank > 0) {
+                layer.wq_a = create_tensor(tn(LLM_TENSOR_ATTN_Q_A, "weight", il), { n_embd, q_lora_rank }, flags);
+                layer.attn_q_a_norm          = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM,           "weight", il), { q_lora_rank }, flags);
+                layer.attn_q_a_norm_gate_up   = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM_GATE_UP,   "weight", il), { q_lora_rank, norm_gate_rank }, flags);
+                layer.attn_q_a_norm_gate_down = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM_GATE_DOWN, "weight", il), { norm_gate_rank, q_lora_rank }, flags);
+                layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q_B, "weight", il), { q_lora_rank, n_head_l * n_embd_head_k_mla }, flags);
+            } else {
+                layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", il), { n_embd, n_head_l * n_embd_head_k_mla }, flags);
+            }
+
+            layer.wkv_a_mqa = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_MQA, "weight", il), { n_embd, kv_lora_rank + n_embd_head_qk_rope }, flags);
+            layer.attn_kv_a_norm          = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM,           "weight", il), { kv_lora_rank }, flags);
+            layer.attn_kv_a_norm_gate_up   = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM_GATE_UP,   "weight", il), { kv_lora_rank, norm_gate_rank }, flags);
+            layer.attn_kv_a_norm_gate_down = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM_GATE_DOWN, "weight", il), { norm_gate_rank, kv_lora_rank }, flags);
+            layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K_B, "weight", il), { n_embd_head_qk_nope, kv_lora_rank, n_head_l }, flags);
+            layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V_B, "weight", il), { kv_lora_rank, n_embd_head_v_mla, n_head_l }, flags);
+            layer.wo   = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { n_head_l * n_embd_head_v_mla, n_embd }, flags);
+
+            layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", il), { n_embd, n_head_l * n_embd_head_v_mla }, flags);
         } else {
-            load_linear_attention(il, flags);
+            layer.wqkv       = create_tensor(tn(LLM_TENSOR_ATTN_QKV,   "weight", il), { n_embd, conv_dim }, flags);
+            layer.wqkv_gate  = create_tensor(tn(LLM_TENSOR_ATTN_GATE,  "weight", il), { n_embd, value_dim }, flags);
+            layer.ssm_conv1d = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "weight", il), { hparams.ssm_d_conv, conv_dim }, flags);
+            layer.ssm_dt     = create_tensor(tn(LLM_TENSOR_SSM_DT,     "bias",   il), { hparams.ssm_dt_rank }, flags);
+            layer.ssm_a      = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,         il), { hparams.ssm_dt_rank }, flags);
+            layer.ssm_beta   = create_tensor(tn(LLM_TENSOR_SSM_BETA,   "weight", il), { n_embd, n_v_heads }, flags);
+            layer.ssm_alpha  = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,  "weight", il), { n_embd, n_v_heads }, flags);
+            layer.ssm_norm   = create_tensor(tn(LLM_TENSOR_SSM_NORM,   "weight", il), { head_v_dim }, flags);
+            layer.ssm_out    = create_tensor(tn(LLM_TENSOR_SSM_OUT,    "weight", il), { value_dim, n_embd }, flags);
         }
 
         if (il < (int) hparams.n_layer_dense_lead || is_mtp) {
-            load_dense_ffn(il, flags);
+            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), { n_embd, n_ff }, flags);
+            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), { n_embd, n_ff }, flags);
+            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), { n_ff,   n_embd }, flags);
         } else {
-            load_moe_ffn(il, flags);
+            layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", il), { n_embd, n_expert }, flags);
+            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   il), { n_expert }, flags);
+            layer.ffn_down_exps   = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,   "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
+            create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
+
+            layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", il), { n_embd,    n_ff_shexp }, flags);
+            layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", il), { n_embd,    n_ff_shexp }, flags);
+            layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", il), { n_ff_shexp, n_embd }, flags);
         }
-    };
 
-    for (int il = 0; il < n_layer; ++il) {
-        load_block(il, trunk_flags, false);
-    }
-
-    for (int il = n_layer; il < n_layer_all; ++il) {
-        const int eff_mtp_flags = mtp_flags;
-        auto & layer = layers[il];
-
-        load_block(il, eff_mtp_flags, true);
-
-        layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2 * n_embd, n_embd }, eff_mtp_flags);
-        load_norm(layer.nextn.enorm, layer.nextn.enorm_gate_up, layer.nextn.enorm_gate_down,
-                LLM_TENSOR_NEXTN_ENORM, LLM_TENSOR_NEXTN_ENORM_GATE_UP, LLM_TENSOR_NEXTN_ENORM_GATE_DOWN,
-                il, n_embd, eff_mtp_flags);
-        load_norm(layer.nextn.hnorm, layer.nextn.hnorm_gate_up, layer.nextn.hnorm_gate_down,
-                LLM_TENSOR_NEXTN_HNORM, LLM_TENSOR_NEXTN_HNORM_GATE_UP, LLM_TENSOR_NEXTN_HNORM_GATE_DOWN,
-                il, n_embd, eff_mtp_flags);
-        layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
-        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
-        load_norm(layer.nextn.shared_head_norm, layer.nextn.shared_head_norm_gate_up, layer.nextn.shared_head_norm_gate_down,
-                LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
-                LLM_TENSOR_NEXTN_SHARED_HEAD_NORM_GATE_UP,
-                LLM_TENSOR_NEXTN_SHARED_HEAD_NORM_GATE_DOWN,
-                il, n_embd, TENSOR_NOT_REQUIRED);
+        if (is_mtp) {
+            layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2 * n_embd, n_embd }, flags);
+            layer.nextn.enorm           = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,           "weight", il), { n_embd }, flags);
+            layer.nextn.enorm_gate_up   = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM_GATE_UP,   "weight", il), { n_embd, norm_gate_rank }, flags);
+            layer.nextn.enorm_gate_down = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM_GATE_DOWN, "weight", il), { norm_gate_rank, n_embd }, flags);
+            layer.nextn.hnorm           = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,           "weight", il), { n_embd }, flags);
+            layer.nextn.hnorm_gate_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM_GATE_UP,   "weight", il), { n_embd, norm_gate_rank }, flags);
+            layer.nextn.hnorm_gate_down = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM_GATE_DOWN, "weight", il), { norm_gate_rank, n_embd }, flags);
+            layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED | flags);
+            layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED | flags);
+            layer.nextn.shared_head_norm           = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,           "weight", il), { n_embd }, TENSOR_NOT_REQUIRED | flags);
+            layer.nextn.shared_head_norm_gate_up   = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM_GATE_UP,   "weight", il), { n_embd, norm_gate_rank }, TENSOR_NOT_REQUIRED | flags);
+            layer.nextn.shared_head_norm_gate_down = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM_GATE_DOWN, "weight", il), { norm_gate_rank, n_embd }, TENSOR_NOT_REQUIRED | flags);
+        }
     }
 }
 

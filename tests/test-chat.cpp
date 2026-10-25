@@ -4403,6 +4403,27 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
     {
         auto tst = peg_tester("models/templates/GigaChat3.5.jinja", detailed_debug);
 
+        tst.test("I'm thinking</think>\n\nHello!")
+            .chat_template_kwargs({ { "reasoning", "true" } })
+            .reasoning_format(COMMON_REASONING_FORMAT_NONE)
+            .tools({ get_time_tool })
+            .expect_content("<think>I'm thinking</think>\n\nHello!")
+            .run();
+
+        tst.test(
+               "Let me check</think>\n\n"
+               "<｜GCML｜tool_calls>\n"
+               "<｜GCML｜invoke name=\"get_time\">\n"
+               "<｜GCML｜parameter name=\"city\" string=\"true\">Tokyo</｜GCML｜parameter>\n"
+               "</｜GCML｜invoke>\n"
+               "</｜GCML｜tool_calls>")
+            .chat_template_kwargs({ { "reasoning", "true" } })
+            .reasoning_format(COMMON_REASONING_FORMAT_NONE)
+            .tools({ get_time_tool })
+            .expect(message_with_tool_calls_and_reasoning("get_time", R"({"city": "Tokyo"})", ""))
+            .expect_content("<think>Let me check</think>\n\n")
+            .run();
+
         tst.test("Hello, world!\nWhat's up?")
             .enable_thinking(false)
             .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
@@ -4486,6 +4507,25 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
     // GigaChat 3.5 Reasoning: the template always opens <think>, even for empty reasoning
     {
         auto tst = peg_tester("models/templates/GigaChat3.5-Reasoning.jinja", detailed_debug);
+
+        tst.test("I'm thinking</think>\n\nHello!")
+            .reasoning_format(COMMON_REASONING_FORMAT_NONE)
+            .tools({ get_time_tool })
+            .expect_content("<think>I'm thinking</think>\n\nHello!")
+            .run();
+
+        tst.test(
+               "Let me check</think>\n\n"
+               "<｜GCML｜tool_calls>\n"
+               "<｜GCML｜invoke name=\"get_time\">\n"
+               "<｜GCML｜parameter name=\"city\" string=\"true\">Tokyo</｜GCML｜parameter>\n"
+               "</｜GCML｜invoke>\n"
+               "</｜GCML｜tool_calls>")
+            .reasoning_format(COMMON_REASONING_FORMAT_NONE)
+            .tools({ get_time_tool })
+            .expect(message_with_tool_calls_and_reasoning("get_time", R"({"city": "Tokyo"})", ""))
+            .expect_content("<think>Let me check</think>\n\n")
+            .run();
 
         // model closes the forced think block immediately and answers
         tst.test("</think>\n\nHello, world!\nWhat's up?")

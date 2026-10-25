@@ -167,7 +167,7 @@ common_chat_params common_chat_params_init_gigachat35(
             tool_calls = p.optional(tool_calls);
         }
 
-        auto content_before_tools = p.negate(p.literal(THINK_START)) + p.content(p.until(FC_START));
+        auto content_before_tools = (extract_reasoning ? p.negate(p.literal(THINK_START)) : p.eps()) + p.content(p.until(FC_START));
         return generation_prompt + reasoning + content_before_tools + tool_calls + end;
     });
 
