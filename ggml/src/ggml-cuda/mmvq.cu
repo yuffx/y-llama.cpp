@@ -320,6 +320,11 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
+    // TurboQuant weight types have their own fused mat-vec path; they are not
+    // implemented in the generic MMVQ kernels and must fall through to it.
+    if (type == GGML_TYPE_TQ3_1S || type == GGML_TYPE_TQ4_1S) {
+        return false;
+    }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE) {
