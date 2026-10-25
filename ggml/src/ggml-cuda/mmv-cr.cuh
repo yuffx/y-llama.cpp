@@ -2,7 +2,7 @@
 
 #include "common.cuh"
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
 
 // Returns true when a CR inverse kernel was launched.
 bool ggml_cuda_mul_mat_vec_cr(

@@ -2663,14 +2663,22 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const ggml_tensor * src0 = src0_;
     const ggml_tensor * src1 = src1_;
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
     const bool is_cr = src0->type == GGML_TYPE_Q8_CR ||
                        src0->type == GGML_TYPE_Q5_CR ||
                        src0->type == GGML_TYPE_Q6_CR;
     if (is_cr) {
         const int cc = ggml_cuda_info().devices[ctx.device].cc;
+#if defined(GGML_USE_HIP)
+        // HIP has no fused CR rotation in the MMVQ path: the fallback quantizes the
+        // rotated activations to Q8_1, which is too coarse for tiny output matrices.
+        // The cooperative inverse kernel uses f32 activations, so use it for the
+        // small shapes where its throughput is irrelevant and accuracy matters.
+        const bool direct_inverse = src0->ne[1] <= 33;
+#else
         const bool direct_inverse = (cc <= GGML_CUDA_CC_PASCAL && src1->ne[1] == 1) ||
                                     src0->ne[1] <= 4;
+#endif
         if (direct_inverse && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
                 src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
                 ggml_is_contiguously_allocated(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
@@ -2680,6 +2688,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             }
         }
 
+#if !defined(GGML_USE_HIP)
         const bool bad_padding_clear =
             ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
             ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
@@ -2713,6 +2722,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
                 return;
             }
         }
+#endif // !GGML_USE_HIP
     }
 #endif
 
