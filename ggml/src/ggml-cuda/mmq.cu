@@ -12,7 +12,7 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             mul_mat_q_case<GGML_TYPE_Q1_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_TQ4_1S:
-            mul_mat_q_case<GGML_TYPE_TQ4_1S>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_TQ4_1S, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q2_0:
             mul_mat_q_case<GGML_TYPE_Q2_0, GGML_PREC_Q8>(ctx, args, stream);
