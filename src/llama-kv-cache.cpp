@@ -297,9 +297,7 @@ llama_kv_cache::llama_kv_cache(
     const bool   turbo_cache = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 ||
                                type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0;
     const bool   tensor_split = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR;
-    const bool   dsv4_cache   = model.arch == LLM_ARCH_DEEPSEEK4 ||
-                                (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0);
-    const bool   tm_base = !tensor_split && !dsv4_cache && !turbo_cache && o_tm && atoi(o_tm) != 0 && !other && n_stream == 1 && !v_trans && type_k == type_v &&
+    const bool   tm_base = !tensor_split && !turbo_cache && o_tm && atoi(o_tm) != 0 && !other && n_stream == 1 && !v_trans && type_k == type_v &&
                            (type_k == GGML_TYPE_F16 || type_k == GGML_TYPE_BF16 || type_k == GGML_TYPE_F32 || ggml_is_quantized(type_k)) && !share;
     // kv-token-major=2 without the tail: cell c in row kv_size-1-c (reversed). The tail keeps forward rows (cell c is row c): its record sits in front of the
     // experts and grows toward them (fork/docs/kv-grow.md). A sparse-attention indexer (GLM5-Next, DeepSeek 3.2, Qwen4Exp) addresses its K rows by CELL number
@@ -310,8 +308,6 @@ llama_kv_cache::llama_kv_cache(
     if (o_tm && atoi(o_tm) != 0 && !tm_on) {
         if (tensor_split) {
             LLAMA_LOG_WARN("%s: kv-token-major is not compatible with tensor parallelism: using per-layer K/V cache tensors\n", __func__);
-        } else if (dsv4_cache) {
-            LLAMA_LOG_WARN("%s: kv-token-major is not compatible with the DeepSeek V4 KV cache: using contiguous K/V tensors\n", __func__);
         } else {
             LLAMA_LOG_WARN("%s: kv-token-major needs K and V of the same float type, one stream, flash attention, no shared cells and no sparse-attention indexer: old layout\n", __func__);
         }

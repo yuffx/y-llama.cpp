@@ -30,12 +30,22 @@ static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
 }
 
 static void dsv4_clear_tensor_stream(ggml_tensor * tensor, uint32_t stream) {
-    GGML_ASSERT(ggml_is_contiguous(tensor));
     GGML_ASSERT(tensor->ne[3] == 1);
     GGML_ASSERT(stream < (uint32_t) tensor->ne[2]);
 
-    const size_t stream_size = tensor->nb[2];
-    ggml_backend_tensor_memset(tensor, 0, stream*stream_size, stream_size);
+    if (ggml_is_contiguous(tensor)) {
+        const size_t stream_size = tensor->nb[2];
+        ggml_backend_tensor_memset(tensor, 0, stream*stream_size, stream_size);
+        return;
+    }
+
+    // Token-major K/V records expose strided views; clear the stream row by row.
+    const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+    std::vector<uint8_t> zeros(row_size, 0);
+    for (int64_t i1 = 0; i1 < tensor->ne[1]; ++i1) {
+        ggml_backend_tensor_set(tensor, zeros.data(),
+            i1*tensor->nb[1] + (int64_t) stream*tensor->nb[2], row_size);
+    }
 }
 
 static uint32_t dsv4_state_n_used_k_rows(llama_pos pos_max, uint32_t ratio, uint32_t kv_size) {
