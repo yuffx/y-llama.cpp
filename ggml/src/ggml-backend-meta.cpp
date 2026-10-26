@@ -1910,7 +1910,13 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
 
 static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
-    GGML_ASSERT(offset == 0);
+    if (offset != 0) {
+        // The async path below only handles a whole tensor; a partial upload (the
+        // expert cache's JIT slot copies) goes through the buffer's sync setter,
+        // which already maps offsets onto the per-device slices.
+        ggml_backend_tensor_set(tensor, data, offset, size);
+        return;
+    }
     GGML_ASSERT(ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
