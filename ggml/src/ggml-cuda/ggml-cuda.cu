@@ -2891,8 +2891,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     if (is_tq_weight && tq_fast_path_ok && src0->type == GGML_TYPE_TQ4_1S
-            && (amd_mfma_available(cc) || amd_wmma_available(cc) || GGML_CUDA_CC_IS_RDNA2(cc)) && ggml_cuda_tq_mmq_enabled()) {
-        // Phase 2 (gfx90a): native MFMA-i8 MMQ prefill via activation pre-rotation.
+            && (amd_mfma_available(cc) || amd_wmma_available(cc) || GGML_CUDA_CC_IS_RDNA2(cc) || cc == GGML_CUDA_CC_VEGA20) && ggml_cuda_tq_mmq_enabled()) {
+        // Phase 2: native TQ4 MMQ prefill via activation pre-rotation.
+        // gfx906 uses the dp4a tile loader + v_dot4_i32_i8.
         // A/B against the cuBLAS path below (unset GGML_TQ_MMQ to fall back).
         ggml_cuda_mul_mat_tq4_1s_mmq(ctx, src0, src1, dst);
         return;
