@@ -203,7 +203,10 @@ llama_kv_cache::llama_kv_cache(
     // Threshold: GQA ratio >= 6 triggers auto-asymmetric.
     {
         const bool k_is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
-        if (k_is_turbo) {
+        // MLA models (DeepSeek-V4) have no separate V cache (V is a view of K),
+        // so K and V types must stay identical; do not split them here.
+        const bool is_mla = hparams.is_mla() || model.arch == LLM_ARCH_DEEPSEEK4;
+        if (k_is_turbo && !is_mla) {
             const uint32_t n_head    = hparams.n_head(0);
             const uint32_t n_head_kv = hparams.n_head_kv(0);
             const uint32_t gqa_ratio = (n_head_kv > 0) ? n_head / n_head_kv : 1;
