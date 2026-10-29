@@ -293,13 +293,23 @@ static void llama_tensor_dequantize_impl(
 //
 
 static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
-    // trivial checks first -- no string ops needed
-    if (params->only_copy)       return false;
-
     // quantize only 2D and 3D tensors (experts)
     if (ggml_n_dims(tensor) < 2) return false;
 
     const std::string name = ggml_get_name(tensor);
+
+    // --copy still honours explicit --tensor-type overrides: those tensors are re-quantized,
+    // everything else is copied verbatim (used to build "same model, only attn in CR8").
+    if (params->only_copy) {
+        if (params->tt_overrides != nullptr) {
+            for (const auto * p = params->tt_overrides; p->pattern != nullptr; ++p) {
+                if (std::regex_search(name, std::regex(p->pattern))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
 
     // This used to be a regex, but <regex> has an extreme cost to compile times.
     bool quantize = name.rfind("weight") == name.size() - 6; // ends with 'weight'?
@@ -796,25 +806,26 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
 
     ggml_type new_type = default_type;
 
-    // get more optimal quantization type based on the tensor shape, layer, etc.
-    if (ggml_is_quantized(default_type)) {
-        // if the user provided tensor types - use those
-        bool manual = false;
-        if (!qs.tensor_type_patterns.empty()) {
-            const std::string tensor_name(tensor->name);
-            for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
-                if (std::regex_search(tensor_name, pattern)) {
-                    if (qtype != new_type) {
-                        LLAMA_LOG_WARN("%s: %-36s - applying manual override: %s -> %s\n",
-                                       __func__, tensor_name.c_str(), ggml_type_name(new_type), ggml_type_name(qtype));
-                        new_type = qtype;
-                    }
-                    manual = true;
-                    break;
+    // if the user provided tensor types - use those (also when the default/source type is not
+    // quantized, e.g. --copy of a BF16 tensor into Q8_CR)
+    bool manual = false;
+    if (!qs.tensor_type_patterns.empty()) {
+        const std::string tensor_name(tensor->name);
+        for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
+            if (std::regex_search(tensor_name, pattern)) {
+                if (qtype != new_type) {
+                    LLAMA_LOG_WARN("%s: %-36s - applying manual override: %s -> %s\n",
+                                   __func__, tensor_name.c_str(), ggml_type_name(new_type), ggml_type_name(qtype));
+                    new_type = qtype;
                 }
+                manual = true;
+                break;
             }
         }
+    }
 
+    // get more optimal quantization type based on the tensor shape, layer, etc.
+    if (ggml_is_quantized(default_type) || manual) {
         // if not manual - use the standard logic for choosing the quantization type based on the selected mixture
         if (!manual && !params->pure) {
             new_type = llama_tensor_get_type_impl(qs, new_type, tensor, params->ftype, tm.category);
@@ -1181,7 +1192,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         metadata[i].allows_quantization = tensor_allows_quantization(params, model->arch, tensor);
 
         if (metadata[i].allows_quantization) {
-            metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
+            // with --copy the "default" for an overridden tensor is its own type: everything
+            // not matched by --tensor-type is copied verbatim, matched tensors get re-quantized
+            const ggml_type type_for_overrides = params->only_copy ? tensor->type : default_type;
+            metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, type_for_overrides, metadata[i]);
         } else {
             metadata[i].target_type = tensor->type;
         }

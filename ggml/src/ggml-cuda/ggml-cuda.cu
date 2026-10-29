@@ -2656,6 +2656,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // Q8_CR weights are stored rotated: rotate the activations with the same
     // matrix and run the standard Q8_0 kernels (the rotations cancel)
     ggml_cuda_pool_alloc<float> src1_rot_buf;
+    ggml_cuda_pool_alloc<float> src1_cpy_buf;
     ggml_tensor src1_rot;
     ggml_tensor src0_q8_0;
     ggml_tensor src0_q5_0;
@@ -2728,8 +2729,22 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     if (src0->type == GGML_TYPE_Q8_CR) {
         if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
-                !ggml_is_contiguous(src1) || src1->ne[0] % QK8_CR != 0) {
-            GGML_ABORT("%s: Q8_CR requires f32 contiguous activations with rows divisible by QK8_CR", __func__);
+                src1->ne[0] % QK8_CR != 0) {
+            GGML_ABORT("%s: Q8_CR requires f32 activations with rows divisible by QK8_CR", __func__);
+        }
+
+        ggml_tensor src1_cont;
+        if (!ggml_is_contiguous(src1)) {
+            // a dense-split slice (or any view) is not contiguous: copy it first, the rotation needs rows
+            src1_cpy_buf.alloc(ctx.pool(), ggml_nelements(src1));
+            src1_cont = *src1;
+            src1_cont.data = src1_cpy_buf.get();
+            src1_cont.nb[0] = sizeof(float);
+            src1_cont.nb[1] = src1_cont.nb[0] * src1_cont.ne[0];
+            src1_cont.nb[2] = src1_cont.nb[1] * src1_cont.ne[1];
+            src1_cont.nb[3] = src1_cont.nb[2] * src1_cont.ne[2];
+            ggml_cuda_cpy(ctx, src1, &src1_cont);
+            src1 = &src1_cont;
         }
 
         src1_rot_buf.alloc(ctx.pool(), ggml_nelements(src1));
