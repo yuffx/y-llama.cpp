@@ -2652,6 +2652,30 @@ static bool ggml_cuda_tq_mmq_enabled() {
     return enabled;
 }
 
+// CR weights are stored rotated: every CR matmul rotates its whole activation first. Allocating a
+// fresh pool block per tensor (hundreds per pass) ballooned VRAM and stalled in cudaMalloc; one
+// grow-only per-device scratch is enough because each rotation is consumed before the next.
+static float * ggml_cuda_cr_rot_buf(int dev, int64_t n) {
+    static float * buf[16] = {};
+    static int64_t cap[16] = {};
+    if (dev < 0 || dev >= 16) {
+        return nullptr;
+    }
+    if (cap[dev] < n) {
+        if (buf[dev] != nullptr) {
+            cudaFree(buf[dev]);
+            buf[dev] = nullptr;
+            cap[dev] = 0;
+        }
+        if (cudaMalloc((void **) &buf[dev], (size_t) n * sizeof(float)) == cudaSuccess) {
+            cap[dev] = n;
+        } else {
+            buf[dev] = nullptr;
+        }
+    }
+    return buf[dev];
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0_, const ggml_tensor * src1_, ggml_tensor * dst) {
     // Q8_CR weights are stored rotated: rotate the activations with the same
     // matrix and run the standard Q8_0 kernels (the rotations cancel)
@@ -2747,10 +2771,17 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             src1 = &src1_cont;
         }
 
-        src1_rot_buf.alloc(ctx.pool(), ggml_nelements(src1));
-
-        src1_rot   = *src1;
-        src1_rot.data = src1_rot_buf.get();
+        {
+            float * rot = ggml_cuda_cr_rot_buf(ggml_cuda_get_device(), ggml_nelements(src1));
+            if (rot != nullptr) {
+                src1_rot = *src1;
+                src1_rot.data = rot;
+            } else {
+                src1_rot_buf.alloc(ctx.pool(), ggml_nelements(src1));
+                src1_rot = *src1;
+                src1_rot.data = src1_rot_buf.get();
+            }
+        }
         ggml_cuda_convrot_rotate(ctx, src1, (float *) src1_rot.data);
 
         src0_q8_0 = *src0;
@@ -2765,10 +2796,17 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             GGML_ABORT("%s: Q5_CR requires f32 contiguous activations with rows divisible by QK8_CR", __func__);
         }
 
-        src1_rot_buf.alloc(ctx.pool(), ggml_nelements(src1));
-
-        src1_rot   = *src1;
-        src1_rot.data = src1_rot_buf.get();
+        {
+            float * rot = ggml_cuda_cr_rot_buf(ggml_cuda_get_device(), ggml_nelements(src1));
+            if (rot != nullptr) {
+                src1_rot = *src1;
+                src1_rot.data = rot;
+            } else {
+                src1_rot_buf.alloc(ctx.pool(), ggml_nelements(src1));
+                src1_rot = *src1;
+                src1_rot.data = src1_rot_buf.get();
+            }
+        }
         ggml_cuda_convrot_rotate(ctx, src1, (float *) src1_rot.data);
 
         src0_q5_0 = *src0;
@@ -2783,10 +2821,17 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             GGML_ABORT("%s: Q6_CR requires f32 contiguous activations with rows divisible by QK8_CR", __func__);
         }
 
-        src1_rot_buf.alloc(ctx.pool(), ggml_nelements(src1));
-
-        src1_rot   = *src1;
-        src1_rot.data = src1_rot_buf.get();
+        {
+            float * rot = ggml_cuda_cr_rot_buf(ggml_cuda_get_device(), ggml_nelements(src1));
+            if (rot != nullptr) {
+                src1_rot = *src1;
+                src1_rot.data = rot;
+            } else {
+                src1_rot_buf.alloc(ctx.pool(), ggml_nelements(src1));
+                src1_rot = *src1;
+                src1_rot.data = src1_rot_buf.get();
+            }
+        }
         ggml_cuda_convrot_rotate(ctx, src1, (float *) src1_rot.data);
 
         src0_q6_K_cr = *src0;
@@ -7048,6 +7093,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #endif
                     if (op->op != GGML_OP_MUL_MAT) {
                         return false; // MoE experts are never quantized to CR types
+                    }
+                    if (a->type == GGML_TYPE_Q8_CR) {
+                        // the runtime copies a strided activation into a contiguous f32 buffer
+                        // before the rotation (see ggml_cuda_mul_mat), so views are fine too
+                        return b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32
+                            && b->ne[0] % QK8_CR == 0;
                     }
                     return b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32
                         && ggml_is_contiguous(b) && ggml_is_contiguous(op)
