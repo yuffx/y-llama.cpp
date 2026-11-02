@@ -72,9 +72,32 @@ static __global__ void tq_prerotate_q8_1(
 // Rescale factor to recover float centroids: 2.733 / 127
 static constexpr float TQ4_CENTROID_I8_RESCALE = 2.733f / 127.0f;
 
+// Byte order of the int8 centroids, indexed by the 4-bit weight code.
+static __device__ __constant__ int8_t TQ4_CENTROIDS_I8[16] = {
+    -127, -96, -75, -58, -44, -31, -18, -6, 6, 18, 31, 44, 58, 75, 96, 127,
+};
+
 // Register-based centroid lookup: maps 4 qs bytes (1 uint32) to 2 packed 4× centroid_i8 for dp4a.
 // Processes a full uint32 at once, sharing nibble extraction across both byte pairs.
-__device__ __forceinline__ void tq4_cents8_reg(uint32_t four_bytes, int &c0, int &c1) {
+// CUDA uses __byte_perm; HIP's byte selector encoding differs, so AMD indexes a
+// 16-byte shared LUT instead (passed in as `lut`).
+__device__ __forceinline__ void tq4_cents8_reg(uint32_t four_bytes, const int8_t * lut, int &c0, int &c1) {
+#if defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const uint32_t b0 =  four_bytes        & 0xFFu;
+    const uint32_t b1 = (four_bytes >>  8) & 0xFFu;
+    const uint32_t b2 = (four_bytes >> 16) & 0xFFu;
+    const uint32_t b3 = (four_bytes >> 24) & 0xFFu;
+
+    c0 = (int)((uint32_t)(uint8_t) lut[b0 & 0xFu]        |
+              ((uint32_t)(uint8_t) lut[b0 >> 4]    <<  8) |
+              ((uint32_t)(uint8_t) lut[b1 & 0xFu]  << 16) |
+              ((uint32_t)(uint8_t) lut[b1 >> 4]    << 24));
+    c1 = (int)((uint32_t)(uint8_t) lut[b2 & 0xFu]        |
+              ((uint32_t)(uint8_t) lut[b2 >> 4]    <<  8) |
+              ((uint32_t)(uint8_t) lut[b3 & 0xFu]  << 16) |
+              ((uint32_t)(uint8_t) lut[b3 >> 4]    << 24));
+#else
+    GGML_UNUSED(lut);
     // Centroid i8 values packed into 4 registers (little-endian byte order):
     // [-127,-96,-75,-58] [-44,-31,-18,-6] [6,18,31,44] [58,75,96,127]
     constexpr uint32_t CR03 = 0xC6B5A081u;
@@ -107,6 +130,7 @@ __device__ __forceinline__ void tq4_cents8_reg(uint32_t four_bytes, int &c0, int
         const uint32_t psel = 0x03020100u | (msb << 2);
         c1 = (int)__byte_perm(flo, fhi, psel);
     }
+#endif
 }
 
 // ============================================================================
@@ -215,10 +239,10 @@ static __global__ void mul_mat_tq4_1s_dp4a_multi(
         const uint32_t w0 = qs32[0], w1 = qs32[1], w2 = qs32[2], w3 = qs32[3];
 
         int c0_0, c1_0, c0_1, c1_1, c0_2, c1_2, c0_3, c1_3;
-        tq4_cents8_reg(w0, c0_0, c1_0);
-        tq4_cents8_reg(w1, c0_1, c1_1);
-        tq4_cents8_reg(w2, c0_2, c1_2);
-        tq4_cents8_reg(w3, c0_3, c1_3);
+        tq4_cents8_reg(w0, TQ4_CENTROIDS_I8, c0_0, c1_0);
+        tq4_cents8_reg(w1, TQ4_CENTROIDS_I8, c0_1, c1_1);
+        tq4_cents8_reg(w2, TQ4_CENTROIDS_I8, c0_2, c1_2);
+        tq4_cents8_reg(w3, TQ4_CENTROIDS_I8, c0_3, c1_3);
 
         #pragma unroll
         for (int j = 0; j < ncols_dst; j++) {
@@ -352,9 +376,32 @@ static __global__ void mul_mat_tq4_1s_scalar_multi(
     const float * act_batch = vy_rot + (int64_t)batch * batch_stride_y;
     float * dst_batch = dst + (int64_t)batch * batch_stride_dst;
 
-    float sumf[ncols_dst] = {};
+    float acc[4][ncols_dst] = {};
 
-    for (int ib = 0; ib < blocks_per_row; ib++) {
+    int ib = 0;
+    for (; ib + 3 < blocks_per_row; ib += 4) {
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const block_tq4_1s * blk = &x_row[ib + u];
+            const float d = (lane < 16) ? __half2float(blk->d0) : __half2float(blk->d1);
+            const uint8_t idx = (blk->qs[lane / 2] >> ((lane & 1) * 4)) & 0xF;
+            const float w = s_lut[idx] * d;
+
+            #pragma unroll
+            for (int j = 0; j < ncols_dst; j++) {
+                const float act = act_batch[j * stride_col_y + (ib + u) * QK_TQ4_1S + lane];
+                acc[u][j] += act * w;
+            }
+        }
+    }
+
+    float sumf[ncols_dst] = {};
+    #pragma unroll
+    for (int j = 0; j < ncols_dst; j++) {
+        sumf[j] = (acc[0][j] + acc[1][j]) + (acc[2][j] + acc[3][j]);
+    }
+
+    for (; ib < blocks_per_row; ib++) {
         const float d = (lane < 16) ? __half2float(x_row[ib].d0) : __half2float(x_row[ib].d1);
         const uint8_t idx = (x_row[ib].qs[lane / 2] >> ((lane & 1) * 4)) & 0xF;
         const float w = s_lut[idx] * d;
@@ -851,10 +898,10 @@ static __global__ void mul_mat_tq4_1s_dp4a_moe(
         const uint32_t w0 = qs32[0], w1 = qs32[1], w2 = qs32[2], w3 = qs32[3];
 
         int c0_0, c1_0, c0_1, c1_1, c0_2, c1_2, c0_3, c1_3;
-        tq4_cents8_reg(w0, c0_0, c1_0);
-        tq4_cents8_reg(w1, c0_1, c1_1);
-        tq4_cents8_reg(w2, c0_2, c1_2);
-        tq4_cents8_reg(w3, c0_3, c1_3);
+        tq4_cents8_reg(w0, TQ4_CENTROIDS_I8, c0_0, c1_0);
+        tq4_cents8_reg(w1, TQ4_CENTROIDS_I8, c0_1, c1_1);
+        tq4_cents8_reg(w2, TQ4_CENTROIDS_I8, c0_2, c1_2);
+        tq4_cents8_reg(w3, TQ4_CENTROIDS_I8, c0_3, c1_3);
 
         const block_q8_1 * a_blk = &a_base[ib];
         const float d_act = __half2float((__half)a_blk->ds.x);
@@ -991,7 +1038,10 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
     const int64_t batch_stride_y_q8 = src1->ne[0] * src1->ne[1] / 32;
     const int64_t batch_stride_y_f32 = src1->ne[0] * src1->ne[1];
     const int64_t batch_stride_dst = dst->ne[0] * dst->ne[1];
-    const bool use_dp4a = !GGML_CUDA_CC_IS_AMD(cc) && src0->type == GGML_TYPE_TQ4_1S;
+    // gfx906 (Vega20) has v_dot4_i32_i8; the AMD centroid lookup uses a byte LUT
+    // instead of __byte_perm, whose selector encoding differs on HIP.
+    const bool use_dp4a = src0->type == GGML_TYPE_TQ4_1S &&
+            (!GGML_CUDA_CC_IS_AMD(cc) || cc == GGML_CUDA_CC_VEGA20);
 
     if (use_dp4a) {
         // NVIDIA TQ4_1S: dp4a int8 path (optimized for Turing+ dp4a throughput)
