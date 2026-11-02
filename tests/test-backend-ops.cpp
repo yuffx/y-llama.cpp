@@ -11148,6 +11148,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Batched TQ4 MUL_MAT: equal 3D/4D batches use the native kernel; broadcast
+    // weights take the cuBLAS fallback. bs=[64,1] mirrors the GigaChat MLA
+    // projection (blk.N.attn_v_b.weight, shape [512,128,64]).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, 128, 1, 512, {2, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, 128, 1, 512, {2, 2}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, 128, 1, 512, {1, 1}, {2, 2}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, 128, 1, 512, {64, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, 128, 8, 512, {64, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, 128, 16, 512, {64, 1}, {1, 1}));
+
     // TQ4_1S: large-batch MUL_MAT exercises the dequant + f16 matmul path used
     // during prompt processing (n > mul_mat_vec_max_cols = 8 forces this path).
     // The fused mul_mat_vec kernel is NOT used for these cases; instead the weights

@@ -2857,6 +2857,26 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    // TQ4_1S with batch axes: the fused decode kernels are flat 2D and the TQ4
+    // prefill helpers ignore ne[2]/ne[3], so batched TQ4 must never reach them.
+    // Equal, contiguous batch layouts use the batch-aware native kernel; anything
+    // else (broadcast weights, larger token batches) takes batched cuBLAS.
+    if (src0->type == GGML_TYPE_TQ4_1S &&
+            (src0->ne[2] > 1 || src0->ne[3] > 1 || src1->ne[2] > 1 || src1->ne[3] > 1)) {
+        const bool native_batch_ok =
+            src1->ne[1] <= MMVQ_MAX_BATCH_SIZE &&
+            src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3] &&
+            src0->ne[2] == dst->ne[2] && src0->ne[3] == dst->ne[3] &&
+            src1->ne[2] * src1->ne[3] <= 65535 &&
+            ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
+        if (native_batch_ok) {
+            ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);
+        } else {
+            ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        }
+        return;
+    }
+
     const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
 
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
@@ -2903,6 +2923,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // The fused TQ kernels index src1/dst as flat contiguous buffers (no nb[] stride handling in
     // mmvq-tq.cu), so permuted/viewed activations (e.g. DeepSeek-V4 MLA projections) must take the
     // stride-aware cuBLAS fallback below, which dequantizes TQ via ggml_get_to_fp16_cuda.
+    // The fused TQ kernels use flat contiguous buffers; batched TQ4 is dispatched above.
     const bool tq_fast_path_ok = ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
 
     // GGML_TYPE_TQ3_1S: the fused warp-scalar kernel (mul_mat_tq3_1s_multi /
@@ -2924,9 +2945,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // Disabling *only* TQ3_1S here (confirmed via a direct A/B on the CUDA0
     // repro: forcing all TQ mul_mats through cuBLAS restores coherent
     // output) routes it to the verified-correct dequant+cuBLAS path below.
-    // TQ4_1S (dp4a and the AMD scalar variant) is untouched — no model on
-    // hand uses it and there's no evidence it shares this bug, so the fast
-    // path stays enabled for that type to avoid regressing existing users.
+    // TQ4_1S native decode remains enabled for its validated single-matrix path;
+    // batched shapes use the dedicated batch-aware dispatch above.
     const bool tq3_1s_fused_disabled = (src0->type == GGML_TYPE_TQ3_1S);
 
     if (is_tq_weight && tq_fast_path_ok && !tq3_1s_fused_disabled && ne11 <= MMVQ_MAX_BATCH_SIZE) {
