@@ -8503,6 +8503,55 @@ struct test_set_rows_turbo3 : public test_case {
     }
 };
 
+struct test_set_rows_turbo4 : public test_case {
+    const ggml_type type_idx;
+    const int64_t ne0;
+    const int64_t ne1;
+    const int r;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_idx, ne0, ne1, r);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SET_ROWS_TURBO4";
+    }
+
+    test_set_rows_turbo4(ggml_type type_idx, int64_t ne0, int64_t ne1, int r)
+        : type_idx(type_idx), ne0(ne0), ne1(ne1), r(r) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_TURBO4_0, ne0, ne1);
+        ggml_set_name(dst, "dst");
+        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, r);
+        ggml_set_name(src, "src");
+        ggml_tensor * row_idxs = ggml_new_tensor_1d(ctx, type_idx, r);
+        ggml_set_name(row_idxs, "row_idxs");
+        ggml_tensor * written = ggml_set_rows(ctx, dst, src, row_idxs);
+        ggml_set_name(written, "out");
+        return written;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) continue;
+            if (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) {
+                init_set_rows_row_ids(t, ne1);
+            } else if (t->type == GGML_TYPE_TURBO4_0) {
+                std::vector<uint8_t> zeros(ggml_nbytes(t), 0);
+                ggml_backend_tensor_set(t, zeros.data(), 0, zeros.size());
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        return 0.05;
+    }
+};
+
 // Test SET_ROWS with TQ4_1S destination (weight quantization), then dequantize and compare.
 // Validates: f32 -> WHT forward -> 16-centroid quantize -> nibble pack -> SET_ROWS
 // followed by: GET_ROWS/CPY -> WHT inverse -> f32 dequant. Round-trip error is bounded.
@@ -8740,7 +8789,7 @@ struct test_flash_attn_ext_turbo4_vec : public test_flash_attn_ext {
         const int64_t block_size = ggml_blck_size(GGML_TYPE_TURBO4_0);
         const size_t block_bytes = ggml_type_size(GGML_TYPE_TURBO4_0);
         const size_t row_size = ggml_row_size(GGML_TYPE_TURBO4_0, head_dim);
-        GGML_ASSERT(block_bytes == sizeof(ggml_fp16_t) + block_size/2);
+        GGML_ASSERT(block_bytes == 2*sizeof(ggml_fp16_t) + block_size/2);
         GGML_ASSERT(row_size == head_dim/block_size*block_bytes);
 
         const float norm_f32 = 1.0f;
@@ -8761,6 +8810,61 @@ struct test_flash_attn_ext_turbo4_vec : public test_flash_attn_ext {
                 }
             }
             ggml_backend_tensor_set(t, data.data(), 0, data.size());
+        }
+    }
+};
+
+struct test_flash_attn_ext_turbo4_mla : public test_flash_attn_ext {
+    const int64_t batch;
+    const int64_t kv;
+    const int64_t n_kv_max;
+
+    test_flash_attn_ext_turbo4_mla(int64_t batch, int64_t kv = 256, int64_t n_kv_max = 0)
+        : test_flash_attn_ext(640, 512, 1, {64, 1}, kv, batch, true, false, 0.0f, 0.0f,
+                              GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0,
+                              {0, 1, 2, 3}, true, true, n_kv_max),
+          batch(batch), kv(kv), n_kv_max(n_kv_max) {}
+
+    std::string vars() override {
+        return "turbo4_mla_k640_v512_kv" + std::to_string(kv) + "_nb" + std::to_string(batch) +
+               "_max" + std::to_string(n_kv_max);
+    }
+
+    double max_nmse_err() override { return 5e-3; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        constexpr int block_size = 128;
+        constexpr size_t block_bytes = 68;
+        constexpr float norm_f32 = 1.0f;
+        ggml_fp16_t norm_f16;
+        ggml_fp32_to_fp16_row(&norm_f32, &norm_f16, 1);
+        const ggml_fp16_t rnorm_f16 = 0;
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) continue;
+            if (t->type == GGML_TYPE_TURBO4_0) {
+                GGML_ASSERT(t->ne[0] == 640);
+                std::vector<uint8_t> data(ggml_nbytes(t), 0);
+                const size_t row_size = ggml_row_size(t->type, t->ne[0]);
+                for (int64_t row = 0; row < ggml_nrows(t); ++row) {
+                    uint8_t * row_data = data.data() + row*row_size;
+                    for (int ib = 0; ib < 640/block_size; ++ib) {
+                        uint8_t * block = row_data + ib*block_bytes;
+                        memcpy(block, &norm_f16, sizeof(norm_f16));
+                        memcpy(block + sizeof(norm_f16), &rnorm_f16, sizeof(rnorm_f16));
+                        for (int j = 0; j < block_size/2; ++j) {
+                            const uint8_t lo = (uint8_t)((j*2 + ib*7 + row) & 0xF);
+                            const uint8_t hi = (uint8_t)((j*2 + 1 + ib*7 + row) & 0xF);
+                            block[2*sizeof(ggml_fp16_t) + j] = lo | (hi << 4);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size());
+            } else if (t->type == GGML_TYPE_I32 || t->type == GGML_TYPE_I64) {
+                init_set_rows_row_ids(t, t->ne[0]);
+            } else {
+                init_tensor_uniform(t);
+            }
         }
     }
 };
@@ -12115,6 +12219,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows_turbo3(GGML_TYPE_I32, 256, 2048, 512));
     test_cases.emplace_back(new test_set_rows_turbo3(GGML_TYPE_I32, 512, 1024, 256));
 
+    // SET_ROWS with turbo4 destination: compare CPU/GPU quantization at a padded MLA width.
+    test_cases.emplace_back(new test_set_rows_turbo4(GGML_TYPE_I32, 640, 16, 4));
+
     // SET_ROWS with TQ4_1S destination: quantize then dequant round-trip
     for (ggml_type idx_type : {GGML_TYPE_I32, GGML_TYPE_I64}) {
         for (int64_t ne0 : {32, 64, 128, 256}) {
@@ -12205,6 +12312,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_turbo4_vec(128));
     test_cases.emplace_back(new test_flash_attn_ext_turbo4_vec(256));
+    for (int64_t nb : {1, 2, 16}) {
+        test_cases.emplace_back(new test_flash_attn_ext_turbo4_mla(nb));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_turbo4_mla(128, 4096, 4096));
+    test_cases.emplace_back(new test_flash_attn_ext_turbo4_mla(512, 4096, 4096));
+    test_cases.emplace_back(new test_flash_attn_ext_turbo4_mla(16, 131072, 4096));
 
     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));

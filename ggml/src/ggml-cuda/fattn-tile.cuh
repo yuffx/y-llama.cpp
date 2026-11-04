@@ -84,6 +84,11 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  8, 256, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 16, 256, 2,  64,  64)
 
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512,  2,  64, 2,  64,  32)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512,  4, 128, 2,  64,  32)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512,  8, 256, 2,  64,  32)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512, 16, 256, 2,  64,  32)
+
     return 0;
 }
 
@@ -152,6 +157,11 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  4, 128, 2,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  8, 256, 2,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 16, 256, 2,  32,  64)
+
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512,  2,  64, 2,  32,  32)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512,  4, 128, 2,  32,  32)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512,  8, 256, 2,  32,  32)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512, 16, 256, 2,  32,  32)
 
     return 0;
 }
@@ -231,6 +241,12 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 16, 256, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 32, 512, 1, 128,  64)
 
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512,  2,  64, 2,  64,  32)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512,  4, 128, 2,  64,  32)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512,  8, 256, 2,  64,  32)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512, 16, 256, 2,  64,  32)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512, 32, 512, 1,  64,  32)
+
     return 0;
 }
 
@@ -308,6 +324,12 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  8, 256, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 16, 256, 4,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 32, 256, 2, 128,  64)
+
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512,  2,  64, 2,  64,  32)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512,  4, 128, 2,  64,  32)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512,  8, 256, 2,  64,  32)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512, 16, 256, 4,  64,  32)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512, 32, 256, 2, 128,  32)
 
     return 0;
 }
@@ -1271,7 +1293,7 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
         GGML_ABORT("flash-attn tile (320/256): expected GQA ratio multiple of 32");
     }
 
-    if constexpr (DKQ == 576) {
+    if constexpr (DKQ == 576 || DKQ == 640) {
         if (use_gqa_opt && gqa_ratio % 16 == 0) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 16, use_logit_softcap>(ctx, dst);
             return;
